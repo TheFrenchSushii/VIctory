@@ -141,7 +141,7 @@ impl GraphicsState {
     ///
     /// # Safety
     /// `at` points at a whole subobject of type `kind`.
-    pub(crate) unsafe fn read(&mut self, kind: u32, at: *const u8) {
+    pub(crate) unsafe fn read(&mut self, kind: u32, at: *const u8) -> bool {
         // SAFETY: the caller passes a whole subobject.
         unsafe {
             let data = at.add(4);
@@ -169,13 +169,24 @@ impl GraphicsState {
                 }
                 12 => {
                     let layout = at.add(8).cast::<D3D12_INPUT_LAYOUT_DESC>().read_unaligned();
-                    if layout.pInputElementDescs.is_null() {
-                        return;
+                    if layout.NumElements == 0 {
+                        // An empty layout replaces a previous layout; it
+                        // must not leave the previous input bindings alive.
+                        self.inputs.clear();
+                        self.names.clear();
+                        return true;
+                    }
+                    // D3D12 has at most 32 input elements and slots.
+                    if layout.pInputElementDescs.is_null() || layout.NumElements > 32 {
+                        return false;
                     }
                     let elements = std::slice::from_raw_parts(
                         layout.pInputElementDescs,
                         layout.NumElements as usize,
                     );
+                    if elements.iter().any(|e| e.SemanticName.0.is_null() || e.InputSlot >= 32) {
+                        return false;
+                    }
                     self.names = elements
                         .iter()
                         .map(|e| CStr::from_ptr(e.SemanticName.0.cast()).to_owned())
@@ -202,11 +213,18 @@ impl GraphicsState {
                 }
                 15 => {
                     self.targets = data.cast::<D3D12_RT_FORMAT_ARRAY>().read_unaligned();
-                    for f in &mut self.targets.RTFormats {
+                    let count = self.targets.NumRenderTargets as usize;
+                    if count > self.targets.RTFormats.len() {
+                        return false;
+                    }
+                    // Unused target entries do not participate in a PSO
+                    // and must not carry stale guest format values.
+                    for f in &mut self.targets.RTFormats[..count] {
                         f.0 = crate::resource::target_format(crate::resource::pc_format(
                             f.0 as u32,
                         )) as i32;
                     }
+                    self.targets.RTFormats[count..].fill(DXGI_FORMAT_UNKNOWN);
                 }
                 16 => {
                     let f = data.cast::<u32>().read_unaligned();
@@ -216,6 +234,7 @@ impl GraphicsState {
                 _ => {}
             }
         }
+        true
     }
 
     /// Everything the state holds, as text: part of a pipeline's name in
@@ -1039,6 +1058,21 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
+
+    #[test]
+    fn render_target_stream_normalizes_only_inactive_formats() {
+        let mut g = GraphicsState::default();
+        // Type followed by eight formats and the active target count.
+        let mut words = [28u32; 10];
+        words[0] = 15;
+        words[9] = 1;
+        assert!(unsafe { g.read(15, words.as_ptr().cast()) });
+        assert_eq!(g.targets.NumRenderTargets, 1);
+        assert_eq!(g.targets.RTFormats[0], DXGI_FORMAT_R8G8B8A8_UNORM);
+        assert!(g.targets.RTFormats[1..].iter().all(|f| *f == DXGI_FORMAT_UNKNOWN));
+        words[9] = 9;
+        assert!(!unsafe { g.read(15, words.as_ptr().cast()) });
+    }
 
     #[test]
     fn integer_target_bypasses_blending_and_preserves_mixed_target_masks() {

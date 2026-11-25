@@ -71,8 +71,9 @@ impl std::fmt::Debug for Shader {
     }
 }
 
-/// Every container seen, by full content hash.
-static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None);
+/// Every container seen, by full content hash and requested stage.
+type ShaderKey = (&'static str, [u8; 32]);
+static SHADERS: Mutex<Option<HashMap<ShaderKey, Arc<Shader>>>> = Mutex::new(None);
 
 /// For the memory lines: containers kept and their bytes, translations
 /// kept and the bytes of their host code. None of them is ever let go.
@@ -103,7 +104,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
     shaders
         .get_or_insert_with(HashMap::new)
-        .entry(*full.as_bytes())
+        .entry((stage, *full.as_bytes()))
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -710,14 +711,20 @@ pub(crate) extern "system" fn create_stream(
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
-    if desc.stream.is_null() {
+    // A stream's declared length is the only known bound on subobjects.
+    // Clear the output on rejection, rather than leaving a stale object.
+    if !out.is_null() {
+        // SAFETY: the title passes room for an output object pointer.
+        unsafe { out.write(std::ptr::null()) };
+    }
+    if desc.stream.is_null() || desc.size == 0 || desc.size > isize::MAX as usize {
         return E_INVALIDARG;
     }
     let mut shaders = Vec::new();
     #[cfg(windows)]
     let mut graphics = host::GraphicsState::default();
     let mut at = 0;
-    while at + 8 <= desc.size {
+    while desc.size - at >= 8 {
         // SAFETY: inside the stream the title passes.
         let kind = unsafe { desc.stream.add(at).cast::<u32>().read_unaligned() };
         let Some((size, stage)) = subobject(kind) else {
@@ -728,10 +735,16 @@ pub(crate) extern "system" fn create_stream(
             );
             break;
         };
+        if size > desc.size - at {
+            tracing::warn!(kind, at, size, remaining = desc.size - at, "truncated pipeline subobject");
+            return E_INVALIDARG;
+        }
         if let Some(stage) = stage {
-            // SAFETY: a shader subobject has its bytecode at +8.
-            let code = unsafe { &*desc.stream.add(at + 8).cast::<Bytecode>() };
-            shaders.extend(copy(stage, code));
+            // SAFETY: the complete shader subobject is within the stream.
+            // Use an unaligned read; the guest stream base need not be
+            // aligned for a Rust reference to Bytecode.
+            let code = unsafe { desc.stream.add(at + 8).cast::<Bytecode>().read_unaligned() };
+            shaders.extend(copy(stage, &code));
         }
         #[cfg(windows)]
         // SAFETY: a whole subobject of this kind lies at `at`.
@@ -823,6 +836,26 @@ mod tests {
             .iter()
             .map(|s| (s.stage, s.container.clone()))
             .collect()
+    }
+
+    #[test]
+    fn identical_shader_bytes_do_not_alias_different_stages() {
+        let bytes = [7, 3, 9, 1];
+        let vertex = shader("vertex", &bytes);
+        let pixel = shader("pixel", &bytes);
+        assert_eq!(vertex.stage, "vertex");
+        assert_eq!(pixel.stage, "pixel");
+        assert!(!Arc::ptr_eq(&vertex, &pixel));
+        assert!(Arc::ptr_eq(&vertex, &shader("vertex", &bytes)));
+    }
+
+    #[test]
+    fn truncated_pipeline_stream_rejects_before_reading_shader_bytecode() {
+        let kind = 1u64.to_le_bytes();
+        let desc = StreamDesc { size: kind.len(), stream: kind.as_ptr() };
+        let mut p: This = std::ptr::null();
+        assert_eq!(create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p), E_INVALIDARG);
+        assert!(p.is_null());
     }
 
     #[test]

@@ -788,6 +788,12 @@ pub(crate) mod host;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+mod xbox_cache;
+#[cfg(windows)]
+pub use xbox_cache::CachedCompute;
+#[cfg(windows)]
+pub(crate) use xbox_cache::create_cached_compute;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.

@@ -346,16 +346,10 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
-/// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
-/// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
-/// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
-/// object `out` names and draws with it; on failure it goes without that
-/// pipeline, silently. What the descriptions hold is not known: the calls
-/// fail as they always did, with `out` null, and the first ones log the
-/// description's words and what its first word points at, so that the two
-/// methods can be written.
-/// shortcut: not implemented. Answering `S_OK` here without making the
-/// pipeline would hand the title whatever its stack held as an object.
+/// Unsupported cached Xbox pipeline descriptions. Slot 0x1c8 carries
+/// graphics, and 0x218 carries compute. The title uses an object returned
+/// on success, so return a null output and E_NOTIMPL when the runtime
+/// cannot reconstruct one from a cached description.
 extern "system" fn unknown_pipeline<const SLOT: usize>(
     _: This,
     desc: *const u8,
@@ -393,10 +387,18 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             calls,
             description = format_args!("{description:x?}"),
             first_points_at = format_args!("{first:x?}"),
-            "a pipeline creation method that is not implemented: the title goes without this pipeline"
+            "Xbox cached pipeline could not be reconstructed (E_NOTIMPL)"
         );
     }
     E_NOTIMPL
+}
+
+extern "system" fn cached_compute(this: This, desc: *const u8, iid: *const Iid, out: *mut This) -> HRESULT {
+    #[cfg(windows)]
+    if let Some(hr) = pipeline::create_cached_compute(desc, iid, out) {
+        return hr;
+    }
+    unknown_pipeline::<0x218>(this, desc, iid, out)
 }
 
 /// IUnknown 3, object methods 4, device methods 76 (0x18-0x290), then the
@@ -438,7 +440,7 @@ static FUNCTIONS: Table<160> = {
     f[57] = unknown_pipeline::<0x1c8> as *const (); // 0x1c8
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
-    f[67] = unknown_pipeline::<0x218> as *const (); // 0x218
+    f[67] = cached_compute as *const (); // 0x218
     f[69] = object::ignore as *const (); // 0x228 debug error filter
     f[70] = descriptor::create_placed_srv as *const (); // 0x230
     f[71] = descriptor::create_placed_uav as *const (); // 0x238

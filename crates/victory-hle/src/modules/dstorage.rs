@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::FromRawHandle;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 use victory_formats::bcpack::{self, Tables};
@@ -1057,14 +1057,22 @@ fn into_destination(
         return fill_virtual_destination(out, fill, victory_gpu::title_bytes_written);
     }
     let offset = (request.page_offset & 0xffff) as usize;
-    let pages = &filled(request.destination.cast(), (offset + len).div_ceil(PAGE))[..];
+    let array = request.destination.cast::<AtomicUsize>();
+    if array.is_null() || !array.is_aligned() {
+        return Err(E_INVALIDARG);
+    }
+    let mut pages = filled(array, (offset + len).div_ceil(PAGE), std::time::Duration::from_millis(100));
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
-    if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
+    if !pages.contains(&0) && let Some(mut window) = super::xmem::page_window(&pages, offset, len) {
         return fill(window.bytes()).map(drop);
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
+    let data = data.get(..n).ok_or(INVALID_DATA)?;
+    if data.is_empty() {
+        return Ok(());
+    }
     // A page the title has just made, or a view the host refuses for a moment (commit
     // or address space short while a load maps many at once), can come right a little
     // later: tried again before the request fails (`VICTORY_DSTORAGE_RETRIES`, default 12,
@@ -1073,12 +1081,20 @@ fn into_destination(
     let retries = *RETRIES.get_or_init(|| {
         std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.parse().ok()).unwrap_or(12)
     });
-    let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
+    let write = |pages: &mut [usize]| {
+        // The producer may publish the page array after the initial wait.
+        // Retrying the original snapshot would keep its zeros indefinitely.
+        if pages.contains(&0) {
+            read_page_numbers(array, pages);
+        }
+        !pages.contains(&0) && super::xmem::write_physical(pages, offset, data)
+    };
+    let mut written = write(&mut pages);
     let mut tries = 0;
     while !written && tries < retries {
         std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
         tries += 1;
-        written = super::xmem::write_physical(pages, offset, &data[..n]);
+        written = write(&mut pages);
     }
     if written {
         if tries > 0 {
@@ -1086,7 +1102,7 @@ fn into_destination(
         }
         Ok(())
     } else {
-        let known = super::xmem::pages_known(pages, offset, len);
+        let known = super::xmem::pages_known(&pages, offset, len);
         tracing::warn!(known, last_error = std::io::Error::last_os_error().raw_os_error(), "dstorage: retries used up");
         // Said aloud: the title never reads a request's result
         // (it only polls for completion), so a destination left unwritten
@@ -1120,26 +1136,29 @@ fn fill_virtual_destination(
     Ok(())
 }
 
+fn read_page_numbers(array: *const AtomicUsize, pages: &mut [usize]) {
+    for (index, page) in pages.iter_mut().enumerate() {
+        // SAFETY: the request keeps one aligned machine word per page until
+        // completion. The x64 title publishes each number with an aligned store.
+        *page = unsafe { (*array.add(index)).load(Ordering::Acquire) };
+    }
+}
+
 /// The page numbers of a destination. The title fills the array after it
 /// enqueued the request (a copy taken then holds zeros, or the numbers of
 /// the array's last use), so it is read when the request runs; a number
 /// that is still zero then is waited for, a tenth of a second at most.
-fn filled(array: *const usize, n: usize) -> Vec<usize> {
+fn filled(array: *const AtomicUsize, n: usize, timeout: std::time::Duration) -> Vec<usize> {
     static LATE: AtomicU64 = AtomicU64::new(0);
-    let read = || -> Vec<usize> {
-        // SAFETY: the title passes a page number per 64 KiB of destination
-        // and keeps the array until the request completes; it may write it
-        // from another thread meanwhile.
-        (0..n).map(|i| unsafe { array.add(i).read_volatile() }).collect()
-    };
-    let mut pages = read();
+    let mut pages = vec![0; n];
+    read_page_numbers(array, &mut pages);
     if !pages.contains(&0) {
         return pages;
     }
     let began = std::time::Instant::now();
-    while pages.contains(&0) && began.elapsed() < std::time::Duration::from_millis(100) {
+    while pages.contains(&0) && began.elapsed() < timeout {
         std::thread::sleep(std::time::Duration::from_millis(2));
-        pages = read();
+        read_page_numbers(array, &mut pages);
     }
     let late = LATE.fetch_add(1, Ordering::Relaxed) + 1;
     if late <= 8 || late.is_power_of_two() {
@@ -1309,16 +1328,46 @@ mod tests {
 
     #[test]
     fn a_page_array_filled_late_is_waited_for() {
-        let array: &'static [std::sync::atomic::AtomicUsize] = Box::leak(Box::new([std::sync::atomic::AtomicUsize::new(7), std::sync::atomic::AtomicUsize::new(0)]));
-        let title = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            array[1].store(8, Ordering::Release);
+        let array = [AtomicUsize::new(7), AtomicUsize::new(0)];
+        assert_eq!(filled(array.as_ptr(), 2, Duration::ZERO), [7, 0]);
+        std::thread::scope(|scope| {
+            let title = scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(10));
+                array[1].store(8, Ordering::Release);
+            });
+            assert_eq!(filled(array.as_ptr(), 2, Duration::from_secs(2)), [7, 8]);
+            title.join().unwrap();
         });
-        assert_eq!(filled(array.as_ptr().cast(), 2), [7, 8]);
-        title.join().unwrap();
-        // One never filled is given up on.
-        array[0].store(0, Ordering::Release);
-        assert_eq!(filled(array.as_ptr().cast(), 2), [0, 8]);
+    }
+
+    #[test]
+    fn physical_destination_rereads_page_numbers_published_after_the_initial_wait() {
+        use crate::modules::xmem;
+
+        let mut page = [0];
+        let mut count = 1;
+        assert_eq!(xmem::XMemAllocatePhysicalPages(0, &mut count, page.as_mut_ptr()), 1);
+        let pages = [AtomicUsize::new(0)];
+        let data = b"late page";
+        let request = request(
+            PAGE_DESTINATION | MEMORY_SOURCE,
+            pages.as_ptr().cast_mut().cast(),
+            data.len(),
+            data.as_ptr().cast(),
+            0,
+            data.len(),
+        );
+        let written = into_destination(&request, data.len(), |out| {
+            pages[0].store(page[0], Ordering::Release);
+            out.copy_from_slice(data);
+            Ok(data.len())
+        });
+        {
+            let mut window = xmem::page_window(&page, 0, data.len()).unwrap();
+            assert_eq!(window.bytes(), data);
+        }
+        assert_eq!(xmem::XMemFreePhysicalPages(1, page.as_ptr()), 1);
+        assert_eq!(written, Ok(()));
     }
 
     #[test]

@@ -1393,20 +1393,25 @@ mod tests {
             assert!(same(start as *const u8, &got), "the GPU reads the title buffer's bytes");
             rig.store(&placed.buffer, placed.bias + 16, &[0xa5; 64]).unwrap();
             assert!(same((start + 16) as *const u8, &[0xa5; 64]), "the GPU's write is at the title's address");
-            // WARP can retain the placed buffer through the recorded copy
-            // even after its fence completes. Release the list and queue
-            // before testing whether Windows will decommit their pages.
-            drop(rig);
+            // Reset the list holding the copy, then let WARP process a
+            // submission after the placed buffer's last reference is gone.
             drop(placed);
-            // Half of it decommitted: turned down, the host not asked.
-            assert_ne!(
-                mem::VirtualFree(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT),
-                0,
-                "decommitting the released D3D12 heap pages: {}",
-                std::io::Error::last_os_error()
-            );
+            rig.run(|_| {}).expect("retiring the placed buffer on WARP");
+            drop(rig);
+            // A completed queue fence does not wait for the OS to unpin
+            // the heap's pages. Require the release within a bounded wait.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while mem::VirtualFree(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT) == 0 {
+                let error = std::io::Error::last_os_error();
+                let pinned = windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER as i32;
+                assert!(
+                    error.raw_os_error() == Some(pinned) && std::time::Instant::now() < deadline,
+                    "decommitting the released D3D12 heap pages: {error}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
             assert!(matches!(place_part(&device, start, len), Err(None)));
-            mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
+            assert_ne!(mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE), 0);
         }
     }
 

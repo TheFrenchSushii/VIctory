@@ -1,4 +1,5 @@
 use anyhow::{Context, bail};
+use std::collections::BTreeSet;
 use std::ffi::c_void;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -13,7 +14,7 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
     let folder = launcher.parent().context("Launcher folder is missing")?;
     let runtime = folder.join("victory.exe");
     let mut args = std::env::args_os().skip(1).peekable();
-    let (mut warp, mut rt, mut warm_only, mut check_paths) = (false, false, false, false);
+    let (mut warp, mut rt, mut warm_only, mut check_paths, mut force_warm) = (false, false, false, false, false);
     while let Some(option) = args.peek() {
         if option == "--warp" {
             warp = true;
@@ -23,6 +24,8 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
             warm_only = true;
         } else if option == "--check-paths" && warm {
             check_paths = true;
+        } else if option == "--force-warm" && warm {
+            force_warm = true;
         } else {
             break;
         }
@@ -41,7 +44,7 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
         }
     };
     if args.next().is_some() {
-        bail!("Usage\n{} [--rt] [--warp]{} [game executable]", launcher.display(), if warm { " [--warm-only] [--check-paths]" } else { "" });
+        bail!("Usage\n{} [--rt] [--warp]{} [game executable]", launcher.display(), if warm { " [--warm-only] [--check-paths] [--force-warm]" } else { "" });
     }
     let game = std::path::absolute(game)?;
     let root = game.parent().context("Game install folder is missing")?;
@@ -136,19 +139,62 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
     }
 
     if warm {
-        let (path, mut log) = open_run_log(&logs, "warm", started, &runtime, &game, rt, warp)?;
-        let mut child = command();
-        child.stderr(log.try_clone()?);
-        let status = preload(&mut child, &game, &cache, &path, &mut log)?;
-        require_success(status, &path)?;
+        let _ = writeln!(std::io::stdout().lock(), "Checking existing shader cache...");
+        let marker = cache.join("warmup-complete-v1.txt");
+        let fingerprint = warm_fingerprint(root, &runtime, rt, warp);
+        let mut ready = false;
+        if !force_warm {
+            match &fingerprint {
+                Ok(key) => match verify_warm_marker(&cache, key) {
+                    Ok(count) => {
+                        ready = true;
+                        let _ = writeln!(std::io::stdout().lock(), "Previous warmup verified: {count} recorded shader cache entries still present. Skipping archive scan and compilation.");
+                    }
+                    Err(error) => {
+                        let _ = writeln!(std::io::stdout().lock(), "Cache requires warmup: {error:#}");
+                    }
+                },
+                Err(error) => {
+                    let _ = writeln!(std::io::stdout().lock(), "Cannot verify game inventory: {error:#}. Warmup required.");
+                }
+            }
+        } else {
+            let _ = writeln!(std::io::stdout().lock(), "Forced warmup requested.");
+        }
+        if !ready {
+            // A cancelled or failed warmup must never retain a success marker.
+            match fs::remove_file(&marker) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).context("Cannot invalidate old warmup marker"),
+            }
+            let (path, mut log) = open_run_log(&logs, "warm", started, &runtime, &game, rt, warp)?;
+            let mut child = command();
+            child.stderr(log.try_clone()?);
+            let status = preload(&mut child, &game, &cache, &path, &mut log)?;
+            require_success(status, &path)?;
+            // Cache readiness is only recorded for a finished, readable scan
+            // of an unchanged game installation and a populated shader cache.
+            let result = (|| -> anyhow::Result<()> {
+                let before = fingerprint?;
+                let after = warm_fingerprint(root, &runtime, rt, warp)?;
+                anyhow::ensure!(before == after, "Game files or runtime changed during warmup");
+                anyhow::ensure!(warm_scan_complete(BufReader::new(File::open(&path)?))?, "Warmup reported inaccessible files or an incomplete scan");
+                write_warm_marker(&cache, &after, started)
+            })();
+            if let Err(error) = result {
+                writeln!(log, "Warmup success marker not recorded: {error:#}")?;
+                let _ = writeln!(std::io::stdout().lock(), "Warmup finished, but cache could not be marked verified: {error:#}");
+            } else {
+                let _ = writeln!(std::io::stdout().lock(), "Warmup completion recorded for future launches.");
+            }
+        }
         if warm_only {
-            let _ = writeln!(std::io::stdout().lock(), "Shader warmup completed. Warm-only mode: game not started.");
+            let _ = writeln!(std::io::stdout().lock(), "Shader preparation finished. Warm-only mode: game not started.");
             return Ok(());
         }
-        // A successful exit and a nonempty final summary are required.
-        // Unsupported shaders can still be reported by the compiler.
         validate_game(&game)?;
-        let _ = writeln!(std::io::stdout().lock(), "Shader warmup completed. Starting the game...");
+        let _ = writeln!(std::io::stdout().lock(), "Shader preparation finished. Starting the game...");
     }
 
     let (path, mut log) = open_run_log(&logs, "run", started, &runtime, &game, rt, warp)?;
@@ -162,6 +208,155 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
         .with_context(|| format!("Could not start {}", runtime.display()))?;
     writeln!(log, "VIctory exited with {status}")?;
     require_success(status, &path)
+}
+
+// Metadata inventory avoids rereading the game's multi-gigabyte archives.
+// Length and modification time detect ordinary updates, not intentional
+// same-size, same-timestamp modifications. The runtime itself still validates
+// cached shader encodings and D3D12 pipeline compatibility when loading them.
+fn warm_fingerprint(root: &Path, runtime: &Path, rt: bool, warp: bool) -> anyhow::Result<String> {
+    fn field(hash: &mut blake3::Hasher, bytes: &[u8]) {
+        hash.update(&(bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+    }
+    fn metadata_field(hash: &mut blake3::Hasher, meta: &fs::Metadata) -> anyhow::Result<()> {
+        field(hash, &meta.len().to_le_bytes());
+        let modified = meta.modified()?.duration_since(UNIX_EPOCH)?;
+        field(hash, &modified.as_secs().to_le_bytes());
+        field(hash, &modified.subsec_nanos().to_le_bytes());
+        Ok(())
+    }
+
+    let mut hash = blake3::Hasher::new();
+    field(&mut hash, b"victory-warm-marker-v1");
+    field(&mut hash, fs::canonicalize(root)?.as_os_str().as_encoded_bytes());
+    field(&mut hash, &[u8::from(rt), u8::from(warp)]);
+    // Hash the actual installed runtime, not just its package version.
+    let mut exe = File::open(runtime)?;
+    let mut buffer = [0u8; 64 * 1024];
+    let mut binary = blake3::Hasher::new();
+    loop {
+        let n = exe.read(&mut buffer)?;
+        if n == 0 { break; }
+        binary.update(&buffer[..n]);
+    }
+    field(&mut hash, binary.finalize().as_bytes());
+
+    // Conservative: any runtime setting change can require a new warmup.
+    let mut env: Vec<_> = std::env::vars_os()
+        .filter(|(key, _)| {
+            let name = key.to_string_lossy().to_ascii_uppercase();
+            name.starts_with("VICTORY_") && name != "VICTORY_LOG" && name != "VICTORY_DEBUG_HUD"
+        })
+        .collect();
+    env.sort();
+    for (key, value) in env {
+        field(&mut hash, key.as_encoded_bytes());
+        field(&mut hash, value.as_encoded_bytes());
+    }
+
+    let mut files = Vec::new();
+    for entry in walkdir::WalkDir::new(root) {
+        let entry = entry?;
+        if entry.file_type().is_file() {
+            let meta = entry.metadata()?;
+            let relative = entry.path().strip_prefix(root)?.to_path_buf();
+            files.push((relative, meta));
+        }
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    for (relative, meta) in files {
+        field(&mut hash, relative.as_os_str().as_encoded_bytes());
+        metadata_field(&mut hash, &meta)?;
+    }
+    Ok(hash.finalize().to_hex().to_string())
+}
+
+// The content-addressed shader store uses a two-character hex directory
+// and a 62-character hex filename. Compare the recorded subset, not the
+// entire directory: gameplay may add more valid entries after warmup.
+fn shader_inventory(cache: &Path) -> anyhow::Result<BTreeSet<String>> {
+    fn hex_name(s: &str, len: usize) -> bool {
+        s.len() == len && s.bytes().all(|c| c.is_ascii_hexdigit())
+    }
+    let shaders = cache.join("shaders");
+    let mut entries = BTreeSet::new();
+    for directory in fs::read_dir(&shaders).context("Shader cache directory missing")? {
+        let directory = directory?;
+        let prefix = directory.file_name();
+        let Some(prefix) = prefix.to_str().filter(|s| hex_name(s, 2)) else { continue };
+        if !directory.file_type()?.is_dir() { continue; }
+        for entry in fs::read_dir(directory.path())? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str().filter(|s| hex_name(s, 62)) else { continue };
+            if !entry.file_type()?.is_file() { continue; }
+            let meta = entry.metadata()?;
+            if meta.len() < 12 { continue; }
+            let modified = meta.modified()?.duration_since(UNIX_EPOCH)?;
+            entries.insert(format!("{prefix}/{name} {} {} {}", meta.len(), modified.as_secs(), modified.subsec_nanos()));
+        }
+    }
+    anyhow::ensure!(!entries.is_empty(), "No nonempty shader cache entries found");
+    Ok(entries)
+}
+
+fn has_pipeline_library(cache: &Path) -> bool {
+    ["host-pipelines.bin", "host-pipelines.next"].iter().any(|name| {
+        fs::metadata(cache.join("pipelines").join(name))
+            .is_ok_and(|meta| meta.is_file() && meta.len() > 0)
+    })
+}
+
+fn marker_entries<'a>(text: &'a str, fingerprint: &str, library_present: bool) -> anyhow::Result<BTreeSet<&'a str>> {
+    let mut lines = text.lines();
+    anyhow::ensure!(lines.next() == Some(fingerprint), "Game, runtime or settings changed");
+    match lines.next() {
+        Some("pipeline=1") => anyhow::ensure!(library_present, "Saved pipeline library missing"),
+        Some("pipeline=0") => {},
+        _ => bail!("Invalid warmup marker"),
+    }
+    let entries: BTreeSet<_> = lines.collect();
+    anyhow::ensure!(!entries.is_empty(), "Warmup marker has no shader entries");
+    Ok(entries)
+}
+
+fn verify_warm_marker(cache: &Path, fingerprint: &str) -> anyhow::Result<usize> {
+    let text = fs::read_to_string(cache.join("warmup-complete-v1.txt"))
+        .context("No verified completion marker; one warmup is needed")?;
+    let expected = marker_entries(&text, fingerprint, has_pipeline_library(cache))?;
+    let current = shader_inventory(cache)?;
+    anyhow::ensure!(expected.iter().all(|entry| current.contains(*entry)), "Recorded shader cache entries are missing or modified");
+    Ok(expected.len())
+}
+
+fn write_warm_marker(cache: &Path, fingerprint: &str, started: u128) -> anyhow::Result<()> {
+    let entries = shader_inventory(cache)?;
+    let temporary = cache.join(format!(".warmup-marker-{started}-{}.tmp", std::process::id()));
+    let marker = cache.join("warmup-complete-v1.txt");
+    let result = (|| -> anyhow::Result<()> {
+        let mut file = OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+        writeln!(file, "{fingerprint}")?;
+        writeln!(file, "pipeline={}", u8::from(has_pipeline_library(cache)))?;
+        for entry in entries { writeln!(file, "{entry}")?; }
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, &marker)?;
+        Ok(())
+    })();
+    if result.is_err() { let _ = fs::remove_file(&temporary); }
+    result
+}
+
+fn warm_scan_complete(reader: impl BufRead) -> std::io::Result<bool> {
+    let mut complete = false;
+    for line in reader.lines() {
+        let line = line?;
+        if let Some(tail) = line.strip_prefix("warm-progress Saving pipeline cache | ") {
+            complete = tail.starts_with("0 inaccessible entries in total");
+        }
+    }
+    Ok(complete)
 }
 
 fn checked_file(path: &Path) -> anyhow::Result<File> {
@@ -382,7 +577,24 @@ pub(super) fn show_error(text: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_warm_summary, last_warm_summary, paths_overlap, show_warm_lines, warm_console_line};
+    use super::{check_warm_summary, last_warm_summary, marker_entries, paths_overlap, show_warm_lines, warm_console_line, warm_scan_complete};
+
+    #[test]
+    fn warm_marker_requires_matching_fingerprint_and_recorded_pipeline() {
+        let marker = "abc\npipeline=1\n00/entry 100 20 0\n";
+        assert_eq!(marker_entries(marker, "abc", true).unwrap().len(), 1);
+        assert!(marker_entries(marker, "different", true).is_err());
+        assert!(marker_entries(marker, "abc", false).is_err());
+        assert!(marker_entries("abc\npipeline=0\n", "abc", false).is_err());
+        assert!(marker_entries("abc\npipeline=0\nentry\n", "abc", false).is_ok());
+    }
+
+    #[test]
+    fn incomplete_or_unreadable_scan_cannot_be_marked_ready() {
+        assert!(!warm_scan_complete(&b"warm  42 translated\n"[..]).unwrap());
+        assert!(!warm_scan_complete(&b"warm-progress Saving pipeline cache | 2 inaccessible entries in total\n"[..]).unwrap());
+        assert!(warm_scan_complete(&b"warm-progress Saving pipeline cache | 0 inaccessible entries in total\n"[..]).unwrap());
+    }
     use std::path::Path;
 
     #[test]

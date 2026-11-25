@@ -65,24 +65,7 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
     let cache = std::env::var_os("VICTORY_CACHE_DIR")
         .filter(|v| !v.is_empty())
         .map_or_else(|| folder.join("cache"), |value| folder.join(value));
-    // Reject source-tree destinations before creating anything. Resolve
-    // existing paths before comparing them, so junctions cannot silently
-    // point the cache at the game's files or the persistent save directory.
-    for dir in [root, logs.as_path(), state.as_path(), cache.as_path()] {
-        victory_core::ensure_outside_repo(dir)?;
-    }
-    for dir in [&logs, &state, &cache] {
-        fs::create_dir_all(dir).with_context(|| format!("Cannot create {}", dir.display()))?;
-    }
-    let dirs = [root, logs.as_path(), state.as_path(), cache.as_path()];
-    let resolved = dirs.iter().map(fs::canonicalize).collect::<std::io::Result<Vec<_>>>()?;
-    for i in 0..resolved.len() {
-        for j in i + 1..resolved.len() {
-            if paths_overlap(&resolved[i], &resolved[j]) {
-                bail!("Game, logs, saves and cache must be separate directories: {} and {}", dirs[i].display(), dirs[j].display());
-            }
-        }
-    }
+    prepare_directories(root, &logs, &state, &cache)?;
     let _session = OpenOptions::new()
         .write(true)
         .create(true)
@@ -203,7 +186,6 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
                 let before = fingerprint?;
                 let after = warm_fingerprint(root, &runtime, rt, warp, performance)?;
                 anyhow::ensure!(before == after, "Game files or runtime changed during warmup");
-                anyhow::ensure!(warm_scan_complete(BufReader::new(File::open(&path)?))?, "Warmup reported inaccessible files or an incomplete scan");
                 write_warm_marker(&cache, &after, started)
             })();
             if let Err(error) = result {
@@ -431,6 +413,31 @@ fn paths_overlap(a: &Path, b: &Path) -> bool {
     prefix(a, b) || prefix(b, a)
 }
 
+fn prepare_directories(game: &Path, logs: &Path, state: &Path, cache: &Path) -> anyhow::Result<()> {
+    let dirs = [game, logs, state, cache];
+    // Resolve junctions and check the layout before even creating empty
+    // directories. This also covers a cache path that does not yet exist.
+    let resolved = dirs
+        .iter()
+        .map(|dir| victory_core::policy::resolve_outside_repo(dir))
+        .collect::<Result<Vec<_>, _>>()?;
+    for (i, path) in resolved.iter().enumerate() {
+        for (j, other) in resolved.iter().enumerate().skip(i + 1) {
+            if paths_overlap(path, other) {
+                bail!(
+                    "Game, logs, saves and cache must be separate directories: {} and {}",
+                    dirs[i].display(),
+                    dirs[j].display()
+                );
+            }
+        }
+    }
+    for dir in [logs, state, cache] {
+        fs::create_dir_all(dir).with_context(|| format!("Cannot create {}", dir.display()))?;
+    }
+    Ok(())
+}
+
 fn open_run_log(
     logs: &Path, action: &str, started: u128, runtime: &Path, game: &Path, rt: bool, warp: bool,
 ) -> anyhow::Result<(PathBuf, File)> {
@@ -487,13 +494,18 @@ fn preload(
             worker.wait()?
         }
     };
-    let last = last_warm_summary(BufReader::new(File::open(path)?));
     writeln!(log, "VIctory exited with {status}")?;
-    if status.success()
-        && let Err(message) = check_warm_summary(last?.as_deref())
-    {
-        writeln!(log, "{message}")?;
-        bail!("{message}\n\nLog file\n{}", path.display());
+    if status.success() {
+        let summary = last_warm_summary(BufReader::new(File::open(path)?))?;
+        if let Err(message) = check_warm_summary(summary.as_deref()) {
+            writeln!(log, "{message}")?;
+            bail!("{message}\n\nLog file\n{}", path.display());
+        }
+        if !warm_scan_complete(BufReader::new(File::open(path)?))? {
+            let message = "Warmup reported inaccessible files or an incomplete scan";
+            writeln!(log, "{message}")?;
+            bail!("{message}\n\nLog file\n{}", path.display());
+        }
     }
     Ok(status)
 }
@@ -601,7 +613,7 @@ pub(super) fn show_error(text: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_warm_summary, last_warm_summary, marker_entries, paths_overlap, show_warm_lines, warm_console_line, warm_scan_complete};
+    use super::{check_warm_summary, last_warm_summary, marker_entries, paths_overlap, prepare_directories, show_warm_lines, warm_console_line, warm_scan_complete};
 
     #[test]
     fn warm_marker_requires_matching_fingerprint_and_recorded_pipeline() {
@@ -627,6 +639,20 @@ mod tests {
         assert!(paths_overlap(Path::new(r"C:\Runtime\cache"), Path::new(r"C:\Runtime\cache")));
         assert!(!paths_overlap(Path::new(r"C:\Runtime\cache"), Path::new(r"C:\Runtime\cache_backup")));
         assert!(!paths_overlap(Path::new(r"C:\Runtime\cache"), Path::new(r"C:\Runtime\state")));
+    }
+
+    #[test]
+    fn overlapping_cache_is_rejected_before_creating_any_directory() {
+        let base = tempfile::tempdir().unwrap();
+        let game = base.path().join("game");
+        std::fs::create_dir(&game).unwrap();
+        let logs = base.path().join("logs");
+        let state = base.path().join("state");
+        for cache in [game.join("cache"), state.join("cache")] {
+            let error = prepare_directories(&game, &logs, &state, &cache).unwrap_err();
+            assert!(error.to_string().contains("must be separate directories"));
+            assert!(!logs.exists() && !state.exists() && !cache.exists());
+        }
     }
 
     #[test]

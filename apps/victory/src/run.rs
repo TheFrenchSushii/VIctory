@@ -127,6 +127,7 @@ pub fn run(
     let code = main
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
+    anyhow::ensure!(code == 0, "Title exited with code {code:#010x}");
     println!("title exited with {code}");
     Ok(())
 }

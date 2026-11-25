@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use victory_shader::emit::host::{self, Host};
 use victory_shader::emit::{self, validator::Validator};
 use victory_shader::structure::{self, Atom, LaneExit};
@@ -176,8 +176,9 @@ pub fn run(
                 .map_or("dxil.dll".into(), |p| p.display().to_string())
         );
     }
+    let warp = std::env::var_os("VICTORY_D3D12_WARP").is_some();
     if pipelines {
-        Host::new(false).map_err(anyhow::Error::msg)?;
+        Host::new(warp).map_err(anyhow::Error::msg)?;
     }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
@@ -191,27 +192,30 @@ pub fn run(
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
     for root in &paths {
-        for entry in walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+        for entry in walkdir::WalkDir::new(root) {
+            let entry = entry.with_context(|| format!("Enumerating shader input {}", root.display()))?;
+            if !entry.file_type().is_file() {
                 continue;
             }
-            if entry.metadata().is_ok_and(|m| m.len() >= 8 * 1024 * 1024) {
+            let size = entry.metadata()?.len();
+            if size > MAX_FILE {
+                tracing::info!(path = %entry.path().display(), size, "shader input exceeds the scan size limit");
+                continue;
+            }
+            if size >= 8 * 1024 * 1024 {
                 tracing::info!(path = %entry.path().display(), "scanning shader archive");
             }
-            let Ok(data) = std::fs::read(entry.path()) else {
-                continue;
-            };
+            let data = std::fs::read(entry.path())
+                .with_context(|| format!("Reading shader input {}", entry.path().display()))?;
             let jobs = sources(&data);
             if !jobs.is_empty() {
                 tracing::info!(path = %entry.path().display(), candidates = jobs.len(), "shader candidates found");
             }
             let next = AtomicUsize::new(0);
-            std::thread::scope(|s| {
+            std::thread::scope(|s| -> Result<()> {
+                let mut workers = Vec::new();
                 for _ in 0..threads.min(jobs.len()) {
-                    s.spawn(|| {
+                    workers.push(s.spawn(|| -> Result<()> {
                         let mut t = Tally {
                             list,
                             ..Tally::default()
@@ -219,19 +223,26 @@ pub fn run(
                         let mut checks = Checks {
                             keep: (!pairs.is_empty()).then(|| kept.clone()),
                             validator: validate
-                                .then(|| Validator::load(dll.as_deref()).ok())
-                                .flatten(),
+                                .then(|| Validator::load(dll.as_deref()).map_err(anyhow::Error::msg))
+                                .transpose()
+                                .context("Initializing the worker's DXIL validator")?,
                             host: pipelines
-                                .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
-                                .flatten(),
+                                .then(|| Host::new(warp).map(|h| (h, host::stub_ps())).map_err(anyhow::Error::msg))
+                                .transpose()
+                                .context("Initializing the worker's Direct3D 12 device")?,
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                             translate(job, entry.path(), &seen, &mut t, &mut checks);
                         }
                         lock(&total).merge(t);
-                    });
+                        Ok(())
+                    }));
                 }
-            });
+                for worker in workers {
+                    worker.join().map_err(|_| anyhow::anyhow!("Shader translation worker panicked"))??;
+                }
+                Ok(())
+            })?;
         }
     }
     let t = total.into_inner().unwrap_or_else(|e| e.into_inner());
@@ -283,8 +294,9 @@ pub fn run(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
+    let mut pair_failures = 0;
     if !pairs.is_empty() {
-        let host = Host::new(false).map_err(anyhow::Error::msg)?;
+        let host = Host::new(warp).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
         let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
         for (v, p) in &pairs {
@@ -293,12 +305,16 @@ pub fn run(
                     host.mesh_pipeline(vs, ps)
                 } else {
                     host.pipeline(vs, ps)
-                }
-                .map(|_| "pipeline created".to_owned())
-                .unwrap_or_else(|e| e),
-                _ => "not emitted".to_owned(),
+                },
+                _ => Err("not emitted".to_owned()),
             };
-            println!("pair {v} + {p}: {made}");
+            match made {
+                Ok(_) => println!("pair {v} + {p}: pipeline created"),
+                Err(error) => {
+                    pair_failures += 1;
+                    println!("pair {v} + {p}: {error}");
+                }
+            }
         }
     }
     let mut lines = t.lines;
@@ -308,9 +324,20 @@ pub fn run(
     }
     let mut failed: Vec<_> = t.failed.into_iter().collect();
     failed.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
+    let translation_failures = failed.iter().filter(|(reason, _)| {
+        !reason.starts_with("validator: ") && !reason.starts_with("pipeline: ")
+    }).map(|(_, (count, _))| count).sum::<usize>();
     for (reason, (n, example)) in failed {
         println!("  {n:>7}  {reason}  (e.g. {example})");
     }
+    let emitted = t.emitted + t.cs_emitted + t.ms_emitted;
+    if validate || pipelines {
+        anyhow::ensure!(emitted > 0, "No shaders emitted for the requested checks");
+    }
+    let invalid = if validate { emitted - (t.validated + t.cs_validated + t.ms_validated) } else { 0 };
+    let refused = if pipelines { emitted - (t.pipelines + t.cs_pipelines + t.ms_pipelines) } else { 0 };
+    anyhow::ensure!(invalid + refused + pair_failures == 0 && (!(validate || pipelines) || translation_failures == 0),
+        "Shader checks failed: {translation_failures} translation failures, {invalid} DXIL validation failures, {refused} pipeline failures, {pair_failures} pair failures");
     Ok(())
 }
 
@@ -367,9 +394,13 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
     let mut unreadable = 0usize;
     for root in &paths {
         for entry in walkdir::WalkDir::new(root) {
-            let Ok(entry) = entry else {
-                unreadable += 1;
-                continue;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    unreadable += 1;
+                    tracing::warn!(%error, "cannot enumerate shader input");
+                    continue;
+                }
             };
             if !entry.file_type().is_file() {
                 continue;
@@ -377,7 +408,10 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
             match entry.metadata() {
                 Ok(m) if m.len() <= MAX_FILE => files.push((entry.into_path(), m.len())),
                 Ok(_) => too_large += 1,
-                Err(_) => unreadable += 1,
+                Err(error) => {
+                    unreadable += 1;
+                    tracing::warn!(path = %entry.path().display(), %error, "cannot read shader input metadata");
+                }
             }
         }
     }
@@ -396,10 +430,13 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                 size / (1024 * 1024),
             ));
         }
-        let Ok(data) = std::fs::read(&path) else {
-            unreadable += 1;
-            warm_progress(format_args!("[file {file}/{file_count}] Cannot read {}", path.display()));
-            continue;
+        let data = match std::fs::read(&path) {
+            Ok(data) => data,
+            Err(error) => {
+                unreadable += 1;
+                warm_progress(format_args!("[file {file}/{file_count}] Cannot read {}: {error}", path.display()));
+                continue;
+            }
         };
         let jobs = sources(&data);
         let total = jobs.len();
@@ -484,15 +521,17 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
     warm_progress(format_args!("Saving pipeline cache | {unreadable} inaccessible entries in total"));
     victory_hle::modules::d3d12x::save_pipeline_cache();
     warm_progress(format_args!("Cache save step finished | {} s elapsed", started.elapsed().as_secs()));
+    let translated = done.into_inner();
     writeln!(
         std::io::stdout().lock(),
-        "warm         {} translated, {} refused; {} compute pipelines, {} refused; {:.0} s",
-        done.into_inner(),
+        "warm         {translated} translated, {} refused; {} compute pipelines, {} refused; {:.0} s",
         refused.into_inner(),
         made.into_inner(),
         unmade.into_inner(),
         started.elapsed().as_secs_f64()
     )?;
+    anyhow::ensure!(unreadable == 0, "Shader scan incomplete: {unreadable} inaccessible entries");
+    anyhow::ensure!(translated != 0, "No shaders successfully translated");
     Ok(())
 }
 

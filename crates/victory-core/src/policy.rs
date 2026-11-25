@@ -39,6 +39,12 @@ pub enum PolicyError {
 /// 2. none of its ancestors contains the [`ROOT_MARKER`] file (catches
 ///    other clones/copies of the repository).
 pub fn ensure_outside_repo(path: &Path) -> Result<(), PolicyError> {
+    resolve_outside_repo(path).map(|_| ())
+}
+
+/// Checks the asset policy and returns the resolved path, including any
+/// components that do not exist yet.
+pub fn resolve_outside_repo(path: &Path) -> Result<PathBuf, PolicyError> {
     let resolved = resolve(path)?;
 
     if let Ok(root) = std::fs::canonicalize(compiled_workspace_root())
@@ -59,7 +65,7 @@ pub fn ensure_outside_repo(path: &Path) -> Result<(), PolicyError> {
             });
         }
     }
-    Ok(())
+    Ok(resolved)
 }
 
 /// Canonicalizes the longest existing prefix of `path` and re-appends the

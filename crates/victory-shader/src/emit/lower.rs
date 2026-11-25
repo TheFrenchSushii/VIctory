@@ -9268,9 +9268,7 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Whether the program reads attribute row `row` per vertex (an
-    /// interpolation with computed barycentrics, or P10 or P20): then its
-    /// element is declared constant and read with `attributeAtVertex`.
+    /// Computed weights and P10/P20 use constant inputs and `attributeAtVertex`.
     fn per_vertex(&self, row: u8) -> bool {
         self.x.io.interps.iter().any(|(_, i)| match *i {
             Interp::Weighted { attribute } => attribute.row == row,
@@ -9281,8 +9279,7 @@ impl<'a> Lower<'a> {
         })
     }
 
-    /// Whether the program interpolates attribute row `row` (so the
-    /// hardware holds P1 - P0 and P2 - P0 for it).
+    /// Interpolated rows carry the console's P1 - P0 and P2 - P0 deltas.
     fn interpolated(&self, row: u8) -> bool {
         self.x.io.interps.iter().any(|(_, i)| match *i {
             Interp::Interpolated { attribute, .. } | Interp::Weighted { attribute } => {
@@ -9292,11 +9289,21 @@ impl<'a> Lower<'a> {
         })
     }
 
-    /// Channel `ch` of input row `row` evaluated as `eval` says, as raw bits.
+    /// Returns the raw bits of the evaluated input channel.
     fn eval_channel(&mut self, row: u8, ch: u8, eval: Eval) -> Result<V, Why> {
         let (id, col) = self
             .find_input(row, ch)
             .ok_or("an input the signature lacks")?;
+        let eval = if self.x.inputs.get(id).is_some_and(|e| e.interp == 1) {
+            // A flat input has zero interpolation deltas. The console can
+            // still read it through an interpolation instruction.
+            match eval {
+                Eval::Weights { p0: false, .. } => return Ok(self.s.m.i32(0)),
+                _ => Eval::Mode(1),
+            }
+        } else {
+            eval
+        };
         let mode = match eval {
             Eval::Mode(mode) => mode,
             Eval::Weights { .. } => 1,
@@ -9328,8 +9335,7 @@ impl<'a> Lower<'a> {
         Ok(self.as_int(acc))
     }
 
-    /// Vertex `k` (0 the provoking vertex, as `barycentric` orders them)
-    /// of a constant input element's channel, as a float.
+    /// A constant input's channel at vertex `k` in barycentric order.
     fn vertex_input(&mut self, id: usize, col: u8, k: u8) -> V {
         let e = &mut self.s.inputs[id];
         e.usage |= 1 << col;

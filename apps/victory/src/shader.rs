@@ -42,12 +42,17 @@ pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
     if sgd5::is_sgd5(data) {
         out.extend(sgd5::records(data).map(Source::Packed));
     }
-    let raw = memchr::memmem::find_iter(data, b"DXBC")
-        .filter(|&offset| Container::parse(&data[offset..]).is_ok())
-        .map(|offset| Source::Raw {
+    let raw = memchr::memmem::find_iter(data, b"DXBC").filter_map(|offset| {
+        let tail = &data[offset..];
+        let total = u32::from_le_bytes(tail.get(0x18..0x1c)?.try_into().ok()?) as usize;
+        let bytes = tail.get(..total)?;
+        Container::parse(bytes).ok()?;
+        // Hash and inspect only the container, never the remainder of the archive.
+        Some(Source::Raw {
             offset,
-            data: &data[offset..],
-        });
+            data: bytes,
+        })
+    });
     out.extend(raw);
     out
 }
@@ -224,4 +229,42 @@ fn format_instruction(i: &Instruction, wave64: bool) -> String {
         None => format!("<{:?} {:#x}>", i.encoding, i.opcode),
     };
     format!("    {:06x}: {:<44} {text}", i.offset, words.join(" "))
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+
+    fn empty_container() -> Vec<u8> {
+        let mut bytes = vec![0; 32];
+        bytes[..4].copy_from_slice(b"DXBC");
+        bytes[0x18..0x1c].copy_from_slice(&32u32.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn raw_sources_exclude_archive_suffix() {
+        let container = empty_container();
+        let mut archive = vec![9; 13];
+        archive.extend_from_slice(&container);
+        archive.extend_from_slice(&[8; 17]);
+        archive.extend_from_slice(&container);
+        archive.extend_from_slice(&[7; 101]);
+        let found = sources(&archive);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].bytes().unwrap().as_ref(), container.as_slice());
+        assert_eq!(found[1].bytes().unwrap().as_ref(), container.as_slice());
+        assert_eq!(found[0].label(), "@0xd");
+        assert_eq!(found[1].label(), "@0x3e");
+    }
+
+    #[test]
+    fn truncated_or_oversized_raw_containers_are_rejected() {
+        let mut bytes = empty_container();
+        bytes[0x18..0x1c].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(sources(&bytes).is_empty());
+        assert!(sources(b"DXBC").is_empty());
+        bytes[0x18..0x1c].copy_from_slice(&4u32.to_le_bytes());
+        assert!(sources(&bytes).is_empty());
+    }
 }

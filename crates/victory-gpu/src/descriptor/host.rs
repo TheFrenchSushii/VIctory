@@ -2539,7 +2539,7 @@ type Kept = Option<ID3D12Resource>;
 /// the bytes must start on 16 (the host's raw view alignment) and be whole
 /// dwords. A view that cannot stays structured.
 fn raw_window(offset: u64, first: u64, count: u32, stride: u32) -> Option<(u64, u32)> {
-    if stride == 0 {
+    if stride == 0 || count == 0 {
         return None;
     }
     let start = first.checked_mul(u64::from(stride))?.checked_add(offset)?;
@@ -2678,6 +2678,15 @@ fn buffer_srv(
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
+    // Reject empty/non-buffer descriptors before looking up or allocating
+    // a host copy. The caller installs its null descriptor on failure.
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER {
+        return None;
+    }
+    // SAFETY: the dimension above selects this union member.
+    if unsafe { desc.Anonymous.Buffer.NumElements } == 0 {
+        return None;
+    }
     let shadow = crate::shadow::find(address, len)?;
     let offset = shadow.offset(address);
     // SAFETY: a live buffer.
@@ -2748,6 +2757,13 @@ fn buffer_uav(
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
+    if desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
+        return None;
+    }
+    // SAFETY: the dimension above selects this union member.
+    if unsafe { desc.Anonymous.Buffer.NumElements } == 0 {
+        return None;
+    }
     let shadow = crate::shadow::find(address, len)?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
@@ -2779,7 +2795,7 @@ fn buffer_uav(
             left_null("not on an element of their host copy", true, address, len, element, buffer.FirstElement);
             return None;
         }
-        buffer.FirstElement += offset / element;
+        buffer.FirstElement = buffer.FirstElement.checked_add(offset / element)?;
     }
     buffer.CounterOffsetInBytes = 0;
     // SAFETY: a live buffer.
@@ -2955,6 +2971,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
+            if size == 0 {
+                return None;
+            }
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
@@ -3682,6 +3701,8 @@ mod tests {
         // past the buffer, not on 16 bytes, no elements
         assert!(!buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, first, count, 0, true, 2000));
         assert!(raw_window(4, 0, 100, 20).is_none());
+        assert!(raw_window(0, 0, 0, 16).is_none());
+        assert!(raw_window(0, u64::MAX, 1, 16).is_none());
         assert!(!buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, 0, 0, 0, true, 4096));
         // a structured view the host takes as it is
         assert!(buffer_view_ok(DXGI_FORMAT_UNKNOWN, 1, 10, 12, false, 4096));

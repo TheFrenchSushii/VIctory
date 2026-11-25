@@ -349,17 +349,22 @@ fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
 /// so a piece that held several ranges was hashed once for each.
 pub(crate) fn joined_piece_runs(mut runs: Vec<CardSpan>) -> Vec<CardSpan> {
     runs.sort_unstable_by_key(|r| r.first);
-    let mut out: Vec<CardSpan> = Vec::with_capacity(runs.len());
-    for run in runs {
-        match out.last_mut() {
-            Some(last) if run.first <= last.first + last.pieces => {
-                last.pieces = last.pieces.max(run.first + run.pieces - last.first);
-                last.to = last.to.max(run.to);
-            }
-            _ => out.push(run),
+    // The input already owns enough storage for the compacted result.
+    // Keep the same sort and merge order, without allocating another vector.
+    let mut len = 0;
+    for read in 0..runs.len() {
+        let run = runs[read];
+        if len > 0 && run.first <= runs[len - 1].first + runs[len - 1].pieces {
+            let last = &mut runs[len - 1];
+            last.pieces = last.pieces.max(run.first + run.pieces - last.first);
+            last.to = last.to.max(run.to);
+        } else {
+            runs[len] = run;
+            len += 1;
         }
     }
-    out
+    runs.truncate(len);
+    runs
 }
 
 /// A declared range of a copy in the card's memory, as the compare on the
@@ -433,6 +438,9 @@ mod card_tests {
         let joined = joined_piece_runs(runs);
         let got: Vec<u32> = joined.iter().flat_map(|r| r.first..r.first + r.pieces).collect();
         assert_eq!(got, wanted);
+        assert!(joined_piece_runs(Vec::new()).is_empty());
+        let single = run(9, 1);
+        assert_eq!(joined_piece_runs(vec![single]), vec![single]);
         assert_eq!(joined.iter().map(|r| (r.first, r.pieces)).collect::<Vec<_>>(), [(3, 5), (9, 1), (40, 3), (100, 1)]);
         assert!(joined.iter().all(|r| r.skew == 7));
         assert!(joined_piece_runs(Vec::new()).is_empty());

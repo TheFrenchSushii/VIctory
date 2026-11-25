@@ -326,14 +326,20 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
 /// Ranges in order, those that overlap or touch as one.
 fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     ranges.sort_unstable();
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for (from, to) in ranges {
-        match out.last_mut() {
-            Some(last) if from <= last.1 => last.1 = last.1.max(to),
-            _ => out.push((from, to)),
+    // Compact the owned vector in place: no second allocation for ranges
+    // produced on each submission.
+    let mut len = 0;
+    for read in 0..ranges.len() {
+        let (from, to) = ranges[read];
+        if len > 0 && from <= ranges[len - 1].1 {
+            ranges[len - 1].1 = ranges[len - 1].1.max(to);
+        } else {
+            ranges[len] = (from, to);
+            len += 1;
         }
     }
-    out
+    ranges.truncate(len);
+    ranges
 }
 
 /// Runs of pieces to hash again (`Host::card_before`), those that overlap
@@ -480,6 +486,9 @@ mod card_tests {
     fn ranges_join_where_they_touch() {
         assert_eq!(joined(vec![(8, 12), (0, 4), (4, 6), (10, 20), (30, 31)]), [(0, 6), (8, 20), (30, 31)]);
         assert!(joined(Vec::new()).is_empty());
+        assert_eq!(joined(vec![(2, 5)]), [(2, 5)]);
+        assert_eq!(joined(vec![(9, 12), (1, 3), (4, 6)]), [(1, 3), (4, 6), (9, 12)]);
+        assert_eq!(joined(vec![(1, 20), (2, 3), (1, 20), (20, 21)]), [(1, 21)]);
     }
 }
 
@@ -2022,7 +2031,8 @@ impl Shadow {
             for &(at, n) in &differing {
                 self.changed(at, at + n);
             }
-            let mut title = vec![0u8; PIECE];
+            // Do not allocate and zero 64 KiB for ranges with no changed bytes.
+            let mut title = None;
             for (at, n) in differing {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
@@ -2038,7 +2048,7 @@ impl Shadow {
                 let last = last_difference(host, old).unwrap_or(first);
                 let (at, n) = (at + first, last + 1 - first);
                 let (host, old) = (&mut host[first..=last], &old[first..=last]);
-                let title = &mut title[..n];
+                let title = &mut title.get_or_insert_with(|| vec![0u8; PIECE])[..n];
                 if !crate::host::read_into((start + at) as *const u8, title) {
                     continue;
                 }

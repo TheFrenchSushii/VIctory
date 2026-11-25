@@ -717,7 +717,7 @@ pub(crate) extern "system" fn create_stream(
         // SAFETY: the title passes room for an output object pointer.
         unsafe { out.write(std::ptr::null()) };
     }
-    if desc.stream.is_null() || desc.size == 0 || desc.size > isize::MAX as usize {
+    if desc.stream.is_null() || desc.size == 0 || desc.size > isize::MAX as usize || !desc.size.is_multiple_of(8) {
         return E_INVALIDARG;
     }
     let mut shaders = Vec::new();
@@ -748,9 +748,10 @@ pub(crate) extern "system" fn create_stream(
         }
         #[cfg(windows)]
         // SAFETY: a whole subobject of this kind lies at `at`.
-        unsafe {
-            graphics.read(kind, desc.stream.add(at))
-        };
+        if !unsafe { graphics.read(kind, desc.stream.add(at)) } {
+            tracing::warn!(kind, at, "invalid graphics pipeline subobject");
+            return E_INVALIDARG;
+        }
         at += size;
     }
     #[cfg(windows)]

@@ -1898,7 +1898,7 @@ impl State {
         // makes room again: so the slots are still looked at (the pass
         // returned here, and a slot whose texture had been streamed out
         // kept its host copy for as long as the card was full).
-        let room = crate::resource::room();
+        let mut room = crate::resource::room();
         host.set_texture_pressure(!room);
         if !room {
             HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
@@ -1985,9 +1985,23 @@ impl State {
             None => (span, per_frame),
         };
         let began = std::time::Instant::now();
-        for (index, write, recovered) in due {
+        for (position, (index, write, recovered)) in due.into_iter().enumerate() {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
                 break;
+            }
+            // The first budget sample can become stale in a large upload
+            // pass (especially during catchup). Recheck in bounded batches,
+            // while still allowing existing textures to be refreshed.
+            if position != 0 && position.is_multiple_of(32) {
+                let available = crate::resource::room();
+                if available != room {
+                    room = available;
+                    host.set_texture_pressure(!room);
+                    if !room {
+                        HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
+                        once!("textures picked by index: VRAM texture budget reached during upload pass; new allocations wait");
+                    }
+                }
             }
             // A placed texture whose memory is not mapped (not streamed in
             // yet, or streamed out again: the heap keeps tens of thousands

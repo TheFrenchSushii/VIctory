@@ -42,6 +42,20 @@ The profile sets `VICTORY_DISPLAY_MODE=1280x720`, `VICTORY_FILL_WORKERS=4` and `
 
 Sushi now excludes unsupported mesh pipelines from the pipeline worker queue and early-start list when the host capability query rejects them. The final D3D12 capability guard is retained. This reduces pointless work but does **not** emulate mesh shaders or restore missing geometry on GPUs without mesh-shader support. The incomplete pipeline creation methods and other rejected host descriptors/pipelines require separate implementation and validation. No FPS improvement has been measured on a GTX 1080 Ti for these changes.
 
+## Graphics compatibility diagnostics
+
+Empty buffer descriptors are now rejected before allocating a backing buffer, and UAV rebasing checks for integer overflow. The texture uploader rechecks its video-memory budget in batches of 32 candidates, rather than relying on a single sample for an entire upload pass. These changes do not make an invalid descriptor valid or guarantee that more textures will fit.
+
+For a diagnostic run with the Windows Direct3D debug layer installed:
+
+```powershell
+$env:VICTORY_D3D12_DEBUG = '1'
+& "$env:LOCALAPPDATA\Sushi\victory-play.exe" --performance
+Remove-Item Env:VICTORY_D3D12_DEBUG -ErrorAction SilentlyContinue
+```
+
+Install the Windows optional **Graphics Tools** feature if the runtime reports that the debug layer is unavailable. Pipeline rejection logs now include shader identifiers and the relevant pipeline/root-signature context. Debug runs are not suitable for measuring FPS. Known unresolved issues include typed 12-byte SRVs whose shared backing is not aligned to an element, unimplemented console pipeline creation methods, and mesh shader emulation on GPUs without native support. Do not bypass the capability/descriptor checks to hide these errors.
+
 ## Try experimental ray tracing on Radeon
 
 After running **Setup.cmd**, open **Sushi (Experimental RT)** from the Windows Start menu. This starts the game with the acceleration-structure builder, ray traversal and lighting resolve enabled. The shortcut uses your existing saves. Open **Sushi** for the usual renderer.

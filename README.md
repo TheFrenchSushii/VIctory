@@ -30,6 +30,18 @@ If the saved game path is incorrect, run Setup.cmd again with the correct `-Game
 
 For a manual build, run `.\Initialize-FormatTables.ps1`, then `cargo build --locked --release -p victory --features diagnostics --bins`. The release binaries are in `target\release`. Place all three together outside the checkout and pass the game executable path to `victory-play.exe`. Custom data and cache directories are documented in the configuration example. [Configuration example](victory.example.toml)
 
+## Experimental performance profile
+
+Run the installed launcher from PowerShell to test a lower reported display mode and parallel CPU preparation, without deleting the cache:
+
+```powershell
+& "$env:LOCALAPPDATA\Sushi\victory-play.exe" --performance
+```
+
+The profile sets `VICTORY_DISPLAY_MODE=1280x720`, `VICTORY_FILL_WORKERS=4` and `VICTORY_PARALLEL_PRELUDES=1` unless explicitly overridden in the environment. These are existing runtime options, not a forced internal rendering resolution; the title may ignore the display mode. Compare the same scene with and without the profile. The default launcher remains unchanged. `victory-warm.exe --performance` also accepts the profile.
+
+Sushi now excludes unsupported mesh pipelines from the pipeline worker queue and early-start list when the host capability query rejects them. The final D3D12 capability guard is retained. This reduces pointless work but does **not** emulate mesh shaders or restore missing geometry on GPUs without mesh-shader support. The incomplete pipeline creation methods and other rejected host descriptors/pipelines require separate implementation and validation. No FPS improvement has been measured on a GTX 1080 Ti for these changes.
+
 ## Try experimental ray tracing on Radeon
 
 After running **Setup.cmd**, open **Sushi (Experimental RT)** from the Windows Start menu. This starts the game with the acceleration-structure builder, ray traversal and lighting resolve enabled. The shortcut uses your existing saves. Open **Sushi** for the usual renderer.

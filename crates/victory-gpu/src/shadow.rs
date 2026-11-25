@@ -968,6 +968,17 @@ mod snapshot_pool_tests {
 
 const NOT_WATCHED: u8 = 2;
 
+/// Intersect a requested range with the memory owned by this copy.
+/// Unlike subtracting the request from the end, this also handles
+/// requests on either side of the allocation without wrapping.
+fn clip_shadow_range(start: u64, width: u64, address: u64, len: u64) -> Option<(u64, u64)> {
+    let end = start.checked_add(width)?;
+    let requested_end = address.checked_add(len)?;
+    let first = address.max(start);
+    let last = requested_end.min(end);
+    (first < last).then(|| (first, last - first))
+}
+
 /// Where `a` and `b` (of one length) first differ, compared eight bytes at
 /// a time.
 fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
@@ -1000,7 +1011,18 @@ fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod difference_tests {
-    use super::{first_difference, last_difference};
+    use super::{clip_shadow_range, first_difference, last_difference};
+
+    #[test]
+    fn shadow_ranges_are_clipped_without_wraparound() {
+        assert_eq!(clip_shadow_range(100, 50, 90, 20), Some((100, 10)));
+        assert_eq!(clip_shadow_range(100, 50, 120, 60), Some((120, 30)));
+        assert_eq!(clip_shadow_range(100, 50, 150, 1), None);
+        assert_eq!(clip_shadow_range(100, 50, 120, 0), None);
+        assert_eq!(clip_shadow_range(100, 50, 90, 5), None);
+        assert_eq!(clip_shadow_range(100, 50, u64::MAX, 1), None);
+        assert_eq!(clip_shadow_range(u64::MAX, 1, 0, 1), None);
+    }
 
     /// The word-wise searches agree with the byte-wise ones they replace.
     #[test]
@@ -1814,8 +1836,13 @@ impl Shadow {
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
-        let len = len.min(self.start + self.len - address);
-        list.defer_refresh(self, address as usize, len as usize);
+        if let Some((address, len)) = clip_shadow_range(self.start, self.len, address, len) {
+            list.defer_refresh(self, address as usize, len as usize);
+        } else {
+            // Preserve the original list's ownership of a bound copy
+            // even when its requested refresh covers no valid bytes.
+            list.defer_refresh(self, self.start as usize, 0);
+        }
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
@@ -1851,7 +1878,7 @@ impl Shadow {
     fn inside(&self, address: usize, len: usize) -> (usize, usize) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let from = address.clamp(start, end);
-        (from - start, (address + len).clamp(from, end) - start)
+        (from - start, address.saturating_add(len).clamp(from, end) - start)
     }
 
     /// Shaders of `list` may write `[address, address + len)` of the copy
@@ -1872,8 +1899,9 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
-        let len = len.min(self.left(address));
-        list.defer_gpu_write(self, address as usize, len as usize);
+        if let Some((address, len)) = clip_shadow_range(self.start, self.len, address, len) {
+            list.defer_gpu_write(self, address as usize, len as usize);
+        }
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders

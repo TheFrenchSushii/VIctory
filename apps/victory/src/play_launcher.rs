@@ -9,17 +9,27 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+// Experimental settings already implemented by the runtime. Keep the
+// default launcher unchanged until measurements establish a benefit.
+const PERFORMANCE_DEFAULTS: [(&str, &str); 3] = [
+    ("VICTORY_DISPLAY_MODE", "1280x720"),
+    ("VICTORY_FILL_WORKERS", "4"),
+    ("VICTORY_PARALLEL_PRELUDES", "1"),
+];
+
 pub(super) fn run(warm: bool) -> anyhow::Result<()> {
     let launcher = std::env::current_exe()?;
     let folder = launcher.parent().context("Launcher folder is missing")?;
     let runtime = folder.join("victory.exe");
     let mut args = std::env::args_os().skip(1).peekable();
-    let (mut warp, mut rt, mut warm_only, mut check_paths, mut force_warm) = (false, false, false, false, false);
+    let (mut warp, mut rt, mut warm_only, mut check_paths, mut force_warm, mut performance) = (false, false, false, false, false, false);
     while let Some(option) = args.peek() {
         if option == "--warp" {
             warp = true;
         } else if option == "--rt" {
             rt = true;
+        } else if option == "--performance" {
+            performance = true;
         } else if option == "--warm-only" && warm {
             warm_only = true;
         } else if option == "--check-paths" && warm {
@@ -44,7 +54,7 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
         }
     };
     if args.next().is_some() {
-        bail!("Usage\n{} [--rt] [--warp]{} [game executable]", launcher.display(), if warm { " [--warm-only] [--check-paths] [--force-warm]" } else { "" });
+        bail!("Usage\n{} [--rt] [--warp] [--performance]{} [game executable]", launcher.display(), if warm { " [--warm-only] [--check-paths] [--force-warm]" } else { "" });
     }
     let game = std::path::absolute(game)?;
     let root = game.parent().context("Game install folder is missing")?;
@@ -109,6 +119,16 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
         if warp {
             child.env("VICTORY_D3D12_WARP", "1");
         }
+        // An opt-in profile. Do not silently change the reported display
+        // size or experimental worker settings for existing installations.
+        // Explicit environment overrides take precedence over the preset.
+        if performance {
+            for (key, value) in PERFORMANCE_DEFAULTS {
+                if std::env::var_os(key).is_none_or(|v| v.is_empty()) {
+                    child.env(key, value);
+                }
+            }
+        }
         if std::env::var_os("VICTORY_DEBUG_HUD").is_none() {
             child.env("VICTORY_DEBUG_HUD", "1");
         }
@@ -121,6 +141,10 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
             .creation_flags(CREATE_NO_WINDOW);
         child
     };
+
+    if performance && warm {
+        let _ = writeln!(std::io::stdout().lock(), "Sushi performance profile: lower reported display resolution and parallel CPU preparation (environment overrides take precedence)");
+    }
 
     if check_paths {
         // Also check the configuration actually resolved by the child (including
@@ -141,7 +165,7 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
     if warm {
         let _ = writeln!(std::io::stdout().lock(), "Checking existing shader cache...");
         let marker = cache.join("warmup-complete-v1.txt");
-        let fingerprint = warm_fingerprint(root, &runtime, rt, warp);
+        let fingerprint = warm_fingerprint(root, &runtime, rt, warp, performance);
         let mut ready = false;
         if !force_warm {
             match &fingerprint {
@@ -177,7 +201,7 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
             // of an unchanged game installation and a populated shader cache.
             let result = (|| -> anyhow::Result<()> {
                 let before = fingerprint?;
-                let after = warm_fingerprint(root, &runtime, rt, warp)?;
+                let after = warm_fingerprint(root, &runtime, rt, warp, performance)?;
                 anyhow::ensure!(before == after, "Game files or runtime changed during warmup");
                 anyhow::ensure!(warm_scan_complete(BufReader::new(File::open(&path)?))?, "Warmup reported inaccessible files or an incomplete scan");
                 write_warm_marker(&cache, &after, started)
@@ -214,7 +238,7 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
 // Length and modification time detect ordinary updates, not intentional
 // same-size, same-timestamp modifications. The runtime itself still validates
 // cached shader encodings and D3D12 pipeline compatibility when loading them.
-fn warm_fingerprint(root: &Path, runtime: &Path, rt: bool, warp: bool) -> anyhow::Result<String> {
+fn warm_fingerprint(root: &Path, runtime: &Path, rt: bool, warp: bool, performance: bool) -> anyhow::Result<String> {
     fn field(hash: &mut blake3::Hasher, bytes: &[u8]) {
         hash.update(&(bytes.len() as u64).to_le_bytes());
         hash.update(bytes);
@@ -230,7 +254,7 @@ fn warm_fingerprint(root: &Path, runtime: &Path, rt: bool, warp: bool) -> anyhow
     let mut hash = blake3::Hasher::new();
     field(&mut hash, b"victory-warm-marker-v1");
     field(&mut hash, fs::canonicalize(root)?.as_os_str().as_encoded_bytes());
-    field(&mut hash, &[u8::from(rt), u8::from(warp)]);
+    field(&mut hash, &[u8::from(rt), u8::from(warp), u8::from(performance)]);
     // Hash the actual installed runtime, not just its package version.
     let mut exe = File::open(runtime)?;
     let mut buffer = [0u8; 64 * 1024];

@@ -5,8 +5,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(super) fn run(warm: bool) -> anyhow::Result<()> {
     let launcher = std::env::current_exe()?;
@@ -151,12 +151,22 @@ fn preload(
     );
     // Give the worker a file rather than a pipe owned by the launcher.
     // A broken console or an interrupted reader cannot panic its workers.
-    let status = child
+    let reader = BufReader::new(File::open(path)?);
+    let mut worker = child
         .arg("warm")
         .arg(root)
         .stdout(log.try_clone()?)
-        .status()
+        .spawn()
         .context("Could not start DexNom Runtime shader preload")?;
+    // Read a regular file, never a pipe: loss of the viewer must not
+    // interrupt the shader compiler or its cache writes.
+    let status = match monitor_warm(&mut worker, reader) {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = writeln!(std::io::stderr().lock(), "Progress viewer error: {error}. Waiting for the compiler; see {}", path.display());
+            worker.wait()?
+        }
+    };
     let last = last_warm_summary(BufReader::new(File::open(path)?));
     writeln!(log, "VIctory exited with {status}")?;
     if status.success()
@@ -166,6 +176,65 @@ fn preload(
         bail!("{message}\n\nLog file\n{}", path.display());
     }
     Ok(status)
+}
+
+/// Only display concise progress records in the console. Full diagnostics
+/// remain in the run log, including individual shader messages.
+fn warm_console_line(line: &str) -> Option<&str> {
+    let line = line.trim_end_matches(['\r', '\n']);
+    if let Some(progress) = line.strip_prefix("warm-progress ") {
+        Some(progress)
+    } else if line.starts_with("warm ") {
+        Some(line)
+    } else {
+        None
+    }
+}
+
+/// Read newly appended complete lines. Keep a partial line for the next poll
+/// so a writer that has not finished a record cannot corrupt the display.
+fn show_warm_lines(reader: &mut impl BufRead, pending: &mut Vec<u8>, output: &mut impl Write) -> std::io::Result<bool> {
+    let mut displayed = false;
+    while reader.read_until(b'\n', pending)? != 0 {
+        if pending.last() != Some(&b'\n') {
+            break;
+        }
+        if let Some(line) = warm_console_line(&String::from_utf8_lossy(pending)) {
+            let _ = writeln!(output, "{line}");
+            displayed = true;
+        }
+        pending.clear();
+    }
+    let _ = output.flush();
+    Ok(displayed)
+}
+
+fn monitor_warm(worker: &mut Child, mut reader: impl BufRead) -> std::io::Result<ExitStatus> {
+    let started = Instant::now();
+    let mut last_update = started;
+    let mut pending = Vec::new();
+    loop {
+        // Check exit before draining the log, so the final summary is also read.
+        let status = worker.try_wait()?;
+        {
+            let mut output = std::io::stdout().lock();
+            if show_warm_lines(&mut reader, &mut pending, &mut output)? {
+                last_update = Instant::now();
+            } else if status.is_none() && last_update.elapsed() >= Duration::from_secs(10) {
+                let _ = writeln!(
+                    output,
+                    "Compiler still running | {} s elapsed | no new progress record yet",
+                    started.elapsed().as_secs()
+                );
+                let _ = output.flush();
+                last_update = Instant::now();
+            }
+        }
+        if let Some(status) = status {
+            return Ok(status);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
 
 /// Read the last completed warmup summary from the append-only run log.
@@ -212,7 +281,27 @@ pub(super) fn show_error(text: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_warm_summary, last_warm_summary};
+    use super::{check_warm_summary, last_warm_summary, show_warm_lines, warm_console_line};
+
+    #[test]
+    fn console_filters_diagnostics_and_displays_progress_and_summary() {
+        assert_eq!(warm_console_line("warm-progress 50%\r\n"), Some("50%"));
+        assert_eq!(warm_console_line("warm  12 translated\n"), Some("warm  12 translated"));
+        assert_eq!(warm_console_line("INFO shader translated\n"), None);
+    }
+
+    #[test]
+    fn console_preserves_a_partial_progress_line() {
+        let mut pending = Vec::new();
+        let mut output = Vec::new();
+        let mut first = &b"INFO detail\nwarm-progress Reading ar"[..];
+        assert!(!show_warm_lines(&mut first, &mut pending, &mut output).unwrap());
+        assert_eq!(pending.as_slice(), b"warm-progress Reading ar");
+        let mut rest = &b"chive\nwarm-progress 50%\nwarm  1 translated\n"[..];
+        assert!(show_warm_lines(&mut rest, &mut pending, &mut output).unwrap());
+        assert!(pending.is_empty());
+        assert_eq!(output.as_slice(), b"Reading archive\n50%\nwarm  1 translated\n");
+    }
 
     #[test]
     fn warm_summary_survives_interleaved_log_messages() {

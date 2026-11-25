@@ -78,23 +78,21 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
         .open(state.join("launcher.lock"))
         .context("Could not lock the launcher state. Check for another DexNom Runtime session.")?;
     let started = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
-    let probe = cache.join(format!(".write-check-{started}-{}", std::process::id()));
-    let file = OpenOptions::new().write(true).create_new(true).open(&probe)
-        .with_context(|| format!("Cache is not writable: {}", cache.display()))?;
-    drop(file);
-    fs::remove_file(&probe).with_context(|| format!("Cannot remove cache write check: {}", probe.display()))?;
+    for dir in [&cache, &logs] {
+        let probe = dir.join(format!(".write-check-{started}-{}", std::process::id()));
+        let file = OpenOptions::new().write(true).create_new(true).open(&probe)
+            .with_context(|| format!("Directory is not writable: {}", dir.display()))?;
+        drop(file);
+        fs::remove_file(&probe).with_context(|| format!("Cannot remove write check: {}", probe.display()))?;
+    }
 
-    if warm {
+    if warm && !check_paths {
         let _ = writeln!(
             std::io::stdout().lock(),
             "Path checks passed\nGame: {}\nGame directory: {}\nCache: {}\nSaves: {}\nLogs: {}",
             game.display(), root.display(), cache.display(), state.display(), logs.display()
         );
     }
-    if check_paths {
-        return Ok(());
-    }
-
     // Keep the same launcher lock for both stages; no gap for another
     // launcher or setup to modify the cache between warmup and gameplay.
     let command = || {
@@ -120,6 +118,22 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
             .creation_flags(CREATE_NO_WINDOW);
         child
     };
+
+    if check_paths {
+        // Also check the configuration actually resolved by the child (including
+        // any explicit VICTORY_CONFIG file), without launching title code.
+        let output = command().arg("config").output()
+            .context("Could not check the runtime configuration")?;
+        if !output.status.success() {
+            bail!("Runtime configuration check failed: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        let config = String::from_utf8_lossy(&output.stdout);
+        if config.contains("POLICY VIOLATION:") {
+            bail!("Runtime configuration check failed:\n{config}");
+        }
+        let _ = writeln!(std::io::stdout().lock(), "{config}\nPath checks passed. No shader compilation or game launch requested.");
+        return Ok(());
+    }
 
     if warm {
         let (path, mut log) = open_run_log(&logs, "warm", started, &runtime, &game, rt, warp)?;

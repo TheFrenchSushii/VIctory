@@ -15,7 +15,17 @@ To update, close the runtime, extract the new source ZIP, and run **Setup.cmd** 
 .\Setup.cmd -GamePath "D:\My Games\Series X\game_scarlett_master.exe"
 ```
 
-To warm the shader cache, open `victory-warm.exe` in the installed runtime directory. The log lists translated and refused shaders. Graphics pipelines also depend on draw state encountered during play. If you see a missing `VCRUNTIME140.dll` error, install Microsoft's x64 redistributable. [Microsoft Visual C++ Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)
+To prepare the shader cache and then automatically start the game, open **DexNom Runtime (Compile shaders and play)** from the Start menu, or run `victory-warm.exe` from the installed runtime directory. The launcher checks the saved game executable, essential GTA VI archives, and separate cache, save and log directories before preloading. It displays the current phase, actual per-file candidate progress and running totals in the console. After a successful compiler exit and nonempty final summary, it starts the game automatically under the same session lock. If preloading fails, it does not start the game. Unsupported shaders may still be reported even after a successful preload; this is not a guarantee of correct rendering.
+
+Optional launcher modes, from PowerShell in the installation directory:
+
+```powershell
+.\victory-warm.exe --check-paths  # validate paths without compiling or playing
+.\victory-warm.exe --warm-only    # compile without starting the game
+.\victory-play.exe               # start the game directly using the existing cache
+```
+
+If the saved game path is incorrect, run Setup.cmd again with the correct `-GamePath`. The warmup and game retain separate logs (`logs\latest-warm.txt` and `logs\latest.txt`). Graphics pipelines also depend on draw state encountered during play. If you see a missing `VCRUNTIME140.dll` error, install Microsoft's x64 redistributable. [Microsoft Visual C++ Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)
 
 For a manual build, run `.\Initialize-FormatTables.ps1`, then `cargo build --locked --release -p victory --features diagnostics --bins`. The release binaries are in `target\release`. Place all three together outside the checkout and pass the game executable path to `victory-play.exe`. Custom data and cache directories are documented in the configuration example. [Configuration example](victory.example.toml)
 

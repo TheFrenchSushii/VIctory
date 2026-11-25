@@ -314,6 +314,41 @@ pub fn run(
     Ok(())
 }
 
+/// Progress output must never panic a worker when the console is closed.
+fn warm_progress(args: std::fmt::Arguments<'_>) {
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "warm-progress {args}");
+    let _ = out.flush();
+}
+
+/// Fraction of discovered candidates examined in this file, not a global
+/// shader count: duplicates and unrecognized containers are also examined.
+fn warm_percent(completed: usize, total: usize) -> usize {
+    if total == 0 {
+        return 100;
+    }
+    ((completed.min(total) as u128 * 100) / total as u128) as usize
+}
+
+fn report_warm_file(
+    file: usize,
+    files: usize,
+    completed: usize,
+    total: usize,
+    counters: [&AtomicUsize; 4],
+    started: std::time::Instant,
+) {
+    let percent = warm_percent(completed, total);
+    let filled = percent / 5;
+    let [done, refused, made, unmade] = counters.map(|c| c.load(Ordering::Relaxed));
+    warm_progress(format_args!(
+        "[file {file}/{files}] [{}{}] {percent:3}% | candidates {completed}/{total} | translated or cached {done} | refused {refused} | compute pipelines {made} (refused {unmade}) | {} s elapsed",
+        "#".repeat(filled),
+        "-".repeat(20 - filled),
+        started.elapsed().as_secs(),
+    ));
+}
+
 /// `victory warm`: fills the caches a run reads (`Command::Warm`).
 pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result<()> {
     anyhow::ensure!(jobs != Some(0), "--jobs must be at least 1");
@@ -323,71 +358,132 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
     let threads = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
     let [done, refused, made, unmade] = [const { AtomicUsize::new(0) }; 4];
+    let counters = [&done, &refused, &made, &unmade];
     let started = std::time::Instant::now();
+
+    warm_progress(format_args!("Inventory: locating eligible files | {threads} workers | compute pipelines: {pipelines}"));
+    let mut files = Vec::new();
+    let mut too_large = 0usize;
+    let mut unreadable = 0usize;
     for root in &paths {
-        for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
-            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
-                continue;
-            }
-            if entry.metadata().is_ok_and(|m| m.len() >= 8 * 1024 * 1024) {
-                tracing::info!(path = %entry.path().display(), "scanning shader archive");
-            }
-            let Ok(data) = std::fs::read(entry.path()) else {
+        for entry in walkdir::WalkDir::new(root) {
+            let Ok(entry) = entry else {
+                unreadable += 1;
                 continue;
             };
-            let jobs = sources(&data);
-            if !jobs.is_empty() {
-                tracing::info!(path = %entry.path().display(), candidates = jobs.len(), "shader candidates found");
+            if !entry.file_type().is_file() {
+                continue;
             }
-            let next = AtomicUsize::new(0);
-            std::thread::scope(|s| {
-                for _ in 0..threads.min(jobs.len()) {
-                    s.spawn(|| {
-                        while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            let Some(bytes) = job.bytes() else { continue };
-                            let Ok(container) = Container::parse(&bytes) else { continue };
-                            // As the title passes it: no more than the container.
-                            let Some(total) = bytes.get(0x18..0x1c).and_then(|b| b.try_into().ok()) else { continue };
-                            let total = u32::from_le_bytes(total) as usize;
-                            let bytes = &bytes[..total.min(bytes.len())];
-                            let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else { continue };
-                            if !lock(&seen).insert(blake3::hash(bytes)) {
-                                continue;
-                            }
-                            let Ok(programs) = native_programs(dxil) else { continue };
-                            let stage = programs.iter().find_map(|p| match p.stage {
-                                HwStage::Vs => Some("vertex"),
-                                HwStage::Ps => Some("pixel"),
-                                HwStage::Ms => Some("mesh"),
-                                HwStage::Cs => Some("compute"),
-                                _ => None,
-                            });
-                            let Some(stage) = stage else { continue };
-                            let compute = pipelines && stage == "compute";
-                            let (translated, pipeline) = victory_hle::modules::d3d12x::warm(stage, bytes, compute);
-                            let count = if translated { &done } else { &refused };
-                            let n = count.fetch_add(1, Ordering::Relaxed) + 1;
-                            match pipeline {
-                                Some(true) => made.fetch_add(1, Ordering::Relaxed),
-                                Some(false) => unmade.fetch_add(1, Ordering::Relaxed),
-                                None => 0,
-                            };
-                            if n.is_multiple_of(2000) {
-                                // A closed console or log must not panic a worker.
-                                tracing::info!(
-                                    seconds = started.elapsed().as_secs(),
-                                    translated = done.load(Ordering::Relaxed),
-                                    refused = refused.load(Ordering::Relaxed),
-                                    "shader warmup progress"
-                                );
-                            }
-                        }
-                    });
-                }
-            });
+            match entry.metadata() {
+                Ok(m) if m.len() <= MAX_FILE => files.push((entry.into_path(), m.len())),
+                Ok(_) => too_large += 1,
+                Err(_) => unreadable += 1,
+            }
         }
     }
+    let file_count = files.len();
+    warm_progress(format_args!(
+        "Inventory complete: {file_count} eligible files, {too_large} above the 2 GiB scan limit, {unreadable} inaccessible entries. Percentages below are per file."
+    ));
+
+    for (index, (path, size)) in files.into_iter().enumerate() {
+        let file = index + 1;
+        let announce = size >= 8 * 1024 * 1024 || file == 1 || file == file_count || file % 100 == 0;
+        if announce {
+            warm_progress(format_args!(
+                "[file {file}/{file_count}] Reading and scanning {} ({} MiB)",
+                path.display(),
+                size / (1024 * 1024),
+            ));
+        }
+        let Ok(data) = std::fs::read(&path) else {
+            unreadable += 1;
+            warm_progress(format_args!("[file {file}/{file_count}] Cannot read {}", path.display()));
+            continue;
+        };
+        let jobs = sources(&data);
+        let total = jobs.len();
+        if total == 0 {
+            if announce {
+                warm_progress(format_args!("[file {file}/{file_count}] No shader candidates"));
+            }
+            continue;
+        }
+        warm_progress(format_args!(
+            "[file {file}/{file_count}] Processing {total} candidates in {}",
+            path.display()
+        ));
+        let next = AtomicUsize::new(0);
+        let completed = AtomicUsize::new(0);
+        let process = |job: &Source<'_>| {
+            let Some(bytes) = job.bytes() else { return };
+            let Ok(container) = Container::parse(&bytes) else { return };
+            // As the title passes it: no more than the container.
+            let Some(total) = bytes.get(0x18..0x1c).and_then(|b| b.try_into().ok()) else { return };
+            let total = u32::from_le_bytes(total) as usize;
+            let bytes = &bytes[..total.min(bytes.len())];
+            let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else { return };
+            if !lock(&seen).insert(blake3::hash(bytes)) {
+                return;
+            }
+            let Ok(programs) = native_programs(dxil) else { return };
+            let stage = programs.iter().find_map(|p| match p.stage {
+                HwStage::Vs => Some("vertex"),
+                HwStage::Ps => Some("pixel"),
+                HwStage::Ms => Some("mesh"),
+                HwStage::Cs => Some("compute"),
+                _ => None,
+            });
+            let Some(stage) = stage else { return };
+            let compute = pipelines && stage == "compute";
+            let (translated, pipeline) = victory_hle::modules::d3d12x::warm(stage, bytes, compute);
+            let count = if translated { &done } else { &refused };
+            count.fetch_add(1, Ordering::Relaxed);
+            match pipeline {
+                Some(true) => made.fetch_add(1, Ordering::Relaxed),
+                Some(false) => unmade.fetch_add(1, Ordering::Relaxed),
+                None => 0,
+            };
+        };
+
+        report_warm_file(file, file_count, 0, total, counters, started);
+        std::thread::scope(|s| {
+            // The main thread reports on a timer, not per shader. Workers
+            // drop their sender even on panic, so reporting cannot deadlock
+            // waiting for a worker that has exited unexpectedly.
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            let workers = threads.min(total);
+            for _ in 0..workers {
+                let tx = tx.clone();
+                let jobs = &jobs;
+                let next = &next;
+                let completed = &completed;
+                let process = &process;
+                s.spawn(move || {
+                    while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        process(job);
+                        completed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let _ = tx.send(());
+                });
+            }
+            drop(tx);
+            let mut remaining = workers;
+            while remaining > 0 {
+                match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                    Ok(()) => remaining -= 1,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => report_warm_file(
+                        file, file_count, completed.load(Ordering::Relaxed), total, counters, started,
+                    ),
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        });
+        report_warm_file(file, file_count, completed.load(Ordering::Relaxed), total, counters, started);
+    }
+    warm_progress(format_args!("Saving pipeline cache | {unreadable} inaccessible entries in total"));
     victory_hle::modules::d3d12x::save_pipeline_cache();
+    warm_progress(format_args!("Cache save step finished | {} s elapsed", started.elapsed().as_secs()));
     writeln!(
         std::io::stdout().lock(),
         "warm         {} translated, {} refused; {} compute pipelines, {} refused; {:.0} s",
@@ -398,6 +494,22 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
         started.elapsed().as_secs_f64()
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod warm_progress_tests {
+    use super::warm_percent;
+
+    #[test]
+    fn candidate_percent_is_bounded_and_uses_the_actual_total() {
+        assert_eq!(warm_percent(0, 100), 0);
+        assert_eq!(warm_percent(1, 3), 33);
+        assert_eq!(warm_percent(2, 3), 66);
+        assert_eq!(warm_percent(3, 3), 100);
+        assert_eq!(warm_percent(4, 3), 100);
+        assert_eq!(warm_percent(0, 0), 100);
+        assert_eq!(warm_percent(usize::MAX, usize::MAX), 100);
+    }
 }
 
 fn translate(

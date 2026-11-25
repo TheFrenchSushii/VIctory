@@ -1666,6 +1666,17 @@ extern "system" fn draw(_: This) {
     count_draw();
 }
 
+/// Check the exclusive end before forming a guest address. A GPU indirect
+/// read must not extend beyond the resource from which the title requested it.
+fn indirect_address(base: u64, width: u64, offset: u64, bytes: u64) -> Option<u64> {
+    if bytes == 0 || offset.checked_add(bytes)? > width {
+        return None;
+    }
+    let address = base.checked_add(offset)?;
+    address.checked_add(bytes)?;
+    Some(address)
+}
+
 /// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,
 /// offset)`. The title's signatures (title+0x2479466, 2026-11-24)
 /// hold one argument each: draw (stride 16), indexed draw (20), dispatch
@@ -1684,6 +1695,11 @@ extern "system" fn execute_indirect(
     count: This,
     count_offset: u64,
 ) {
+    // D3D12 executes no records when MaxCommandCount is zero. Avoid
+    // queueing work, clamping arguments, or counting a dropped draw.
+    if max == 0 {
+        return;
+    }
     count_draw();
     let Some((stride, args)) = crate::signature::layout(signature) else {
         #[cfg(windows)]
@@ -1692,8 +1708,27 @@ extern "system" fn execute_indirect(
         }
         return;
     };
-    let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
-    let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
+    // A one-argument signature must hold its complete command. Other
+    // signatures remain unsupported, as before.
+    let bytes = match args {
+        [[kind, ..]] => {
+            let minimum = match *kind {
+                0 => 16,
+                1 => 20,
+                2 | 10 | 105 => 12,
+                _ => 0,
+            };
+            (minimum != 0 && stride >= minimum && stride.is_multiple_of(4))
+                .then_some(u64::from(stride) * u64::from(max))
+        }
+        _ => None,
+    };
+    let address = bytes.and_then(|bytes| {
+        crate::resource::buffer_bytes(arguments)
+            .and_then(|(p, width)| indirect_address(p as u64, width, offset, bytes))
+    });
+    let counter = crate::resource::buffer_bytes(count)
+        .and_then(|(p, width)| indirect_address(p as u64, width, count_offset, 4));
     let mut ran = false;
     #[cfg(windows)]
     if let ([[kind, ..]], Some(address)) = (args, address)
@@ -2171,6 +2206,20 @@ const fn list_table(newer: bool) -> [*const (); 160] {
 /// titles add.
 static LIST_FUNCTIONS: Table<160> = Table(list_table(false));
 static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
+
+#[cfg(test)]
+mod indirect_range_tests {
+    use super::indirect_address;
+
+    #[test]
+    fn indirect_reads_stay_inside_the_argument_resource() {
+        assert_eq!(indirect_address(0x1000, 64, 16, 48), Some(0x1010));
+        assert_eq!(indirect_address(0x1000, 64, 16, 49), None);
+        assert_eq!(indirect_address(0x1000, 64, 64, 0), None);
+        assert_eq!(indirect_address(0x1000, 64, u64::MAX, 4), None);
+        assert_eq!(indirect_address(u64::MAX - 3, 64, 0, 4), None);
+    }
+}
 
 #[cfg(test)]
 mod tests {

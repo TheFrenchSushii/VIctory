@@ -2244,6 +2244,11 @@ impl HostHeap {
         if !buffer {
             return true;
         }
+        // Empty and malformed views have no backing to maintain; do not
+        // allocate a shadow merely to check whether their null slot is current.
+        if buffer_range(view).is_none() {
+            return true;
+        }
         let Some((address, width)) = buffer_extent(view) else { return true };
         let Some(shadow) = crate::shadow::find(address, width) else { return false };
         if let Some(current) = self.shows(index, &shadow.buffer) {
@@ -2444,13 +2449,13 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
         _ => return None,
     };
     let desc = srv_desc(words);
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER {
+        return None;
+    }
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { desc.Anonymous.Buffer };
-    Some((
-        base.checked_add(buffer.FirstElement.checked_mul(element)?)?,
-        u64::from(buffer.NumElements) * element,
-    ))
+    checked_buffer_range(base, buffer.FirstElement, buffer.NumElements, element)
 }
 
 /// The title memory the host slot of buffer view `view` is made on
@@ -2510,6 +2515,9 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
 /// [`buffer_range`] of an unordered access view of memory at `base`.
 fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     let desc = uav_desc(words);
+    if desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
+        return None;
+    }
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { desc.Anonymous.Buffer };
     let element = if buffer.StructureByteStride > 0 {
@@ -2519,10 +2527,20 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     } else {
         crate::resource::element(desc.Format.0 as u32)?.0
     };
-    Some((
-        base.checked_add(buffer.FirstElement.checked_mul(element)?)?,
-        u64::from(buffer.NumElements) * element,
-    ))
+    checked_buffer_range(base, buffer.FirstElement, buffer.NumElements, element)
+}
+
+/// Do not schedule transfers for an empty, unknown-size, or overflowing
+/// descriptor. In particular, the end must be representable: consumers
+/// of this range form an exclusive end when merging GPU writebacks.
+fn checked_buffer_range(base: u64, first: u64, count: u32, element: u64) -> Option<(u64, u64)> {
+    if count == 0 || element == 0 {
+        return None;
+    }
+    let start = base.checked_add(first.checked_mul(element)?)?;
+    let len = u64::from(count).checked_mul(element)?;
+    start.checked_add(len)?;
+    Some((start, len))
 }
 
 /// The host resource a slot made by [`make`] views, if any.
@@ -3715,6 +3733,16 @@ mod tests {
         assert_eq!(constant_size(65_536), 65_536);
         assert_eq!(constant_size(969_472), 65_536);
         assert_eq!(constant_size(u32::MAX), 65_536);
+    }
+
+    #[test]
+    fn invalid_buffer_ranges_do_not_schedule_memory_transfers() {
+        assert_eq!(checked_buffer_range(0x1000, 2, 42, 12), Some((0x1018, 504)));
+        assert_eq!(checked_buffer_range(0x1000, 2, 0, 12), None);
+        assert_eq!(checked_buffer_range(0x1000, 2, 42, 0), None);
+        assert_eq!(checked_buffer_range(0, u64::MAX, 2, 4), None);
+        assert_eq!(checked_buffer_range(u64::MAX - 3, 0, 1, 4), None);
+        assert_eq!(checked_buffer_range(0, 0, u32::MAX, u64::MAX), None);
     }
 
     #[test]

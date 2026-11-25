@@ -581,7 +581,14 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                    tracing::warn!(
+                        error = %e, ?shaders, kind = "compute",
+                        dxil_bytes = desc.CS.BytecodeLength,
+                        root_bytes = root_blob.len(),
+                        root_parameters = params.len(),
+                        static_samplers = samplers.len(),
+                        "host pipeline refused"
+                    );
                     host.log_messages();
                     return None;
                 }
@@ -634,7 +641,7 @@ impl HostPipeline {
             let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
+                    tracing::warn!(error = %e, ?shaders, graphics_state = %state, "host mesh pipeline refused");
                     host.log_messages();
                     return None;
                 }
@@ -740,7 +747,14 @@ impl HostPipeline {
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                tracing::warn!(
+                    error = %e, ?shaders, kind = "graphics",
+                    graphics_state = %state,
+                    root_bytes = root_blob.len(),
+                    root_parameters = params.len(),
+                    static_samplers = samplers.len(),
+                    "host pipeline refused"
+                );
                 host.log_messages();
                 return None;
             }

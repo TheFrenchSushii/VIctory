@@ -37,10 +37,38 @@ if (!$GamePath) {
         $GamePath = $picker.FileName
     } finally { $picker.Dispose() }
 }
-$game = Get-Item -LiteralPath $GamePath
-if ($game.PSIsContainer -or $game.Extension -ine '.exe') {
-    throw 'Select the game executable in its original installation directory.'
+if (!(Test-Path -LiteralPath $GamePath -PathType Leaf)) {
+    throw "Game executable not found: $GamePath. Select the correct .exe in Setup.cmd."
 }
+$game = Get-Item -LiteralPath $GamePath
+if ($game.PSIsContainer -or $game.Extension -ine '.exe' -or $game.Length -lt 2) {
+    throw "Select a nonempty game executable in its original installation directory: $GamePath"
+}
+$stream = [IO.File]::OpenRead($game.FullName)
+try {
+    if ($stream.ReadByte() -ne 0x4d -or $stream.ReadByte() -ne 0x5a) {
+        throw "The selected file is not a readable PE executable: $GamePath"
+    }
+} finally { $stream.Dispose() }
+if ($game.Name -ieq 'game_scarlett_master.exe') {
+    $missing = @(
+        foreach ($name in 'MicrosoftGame.Config','common.rpf','data.rpf','levels.rpf','shaders.rpf') {
+            $asset = Get-Item -LiteralPath (Join-Path $game.DirectoryName $name) -ErrorAction SilentlyContinue
+            if (!$asset -or $asset.PSIsContainer -or $asset.Length -eq 0) { $name }
+        }
+    )
+    if ($missing.Count -gt 0) {
+        throw "Game installation is incomplete in $($game.DirectoryName): $($missing -join ', '). Select the complete installation."
+    }
+}
+$gameRoot = $game.DirectoryName.TrimEnd([char]92, [char]47) + [IO.Path]::DirectorySeparatorChar
+$installRoot = $InstallDir.TrimEnd([char]92, [char]47) + [IO.Path]::DirectorySeparatorChar
+if ($gameRoot.StartsWith($installRoot, [StringComparison]::OrdinalIgnoreCase) -or $installRoot.StartsWith($gameRoot, [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'The game and runtime installation must be separate directories.'
+}
+Write-Host "Game executable: $($game.FullName)"
+Write-Host "Install directory: $InstallDir"
+Write-Host 'Game path checks passed. Building the runtime...'
 
 Push-Location -LiteralPath $PSScriptRoot
 try {
@@ -84,13 +112,14 @@ Write-Host "Installed DexNom Runtime in $InstallDir"
 [IO.Directory]::CreateDirectory($ShortcutDirectory) | Out-Null
 $shell = New-Object -ComObject WScript.Shell
 foreach ($entry in @(
-    @{ Name = 'DexNom Runtime'; Arguments = '' }
-    @{ Name = 'DexNom Runtime (Experimental RT)'; Arguments = '--rt' }
+    @{ Name = 'DexNom Runtime'; Arguments = ''; Target = $launcher }
+    @{ Name = 'DexNom Runtime (Compile shaders and play)'; Arguments = ''; Target = (Join-Path $InstallDir 'victory-warm.exe') }
+    @{ Name = 'DexNom Runtime (Experimental RT)'; Arguments = '--rt'; Target = $launcher }
 )) {
     $shortcut = $shell.CreateShortcut((Join-Path $ShortcutDirectory ($entry.Name + '.lnk')))
-    $shortcut.TargetPath = $launcher
+    $shortcut.TargetPath = $entry.Target
     $shortcut.Arguments = $entry.Arguments
     $shortcut.WorkingDirectory = $InstallDir
     $shortcut.Save()
 }
-Write-Host "Open DexNom Runtime from $ShortcutDirectory to play, or select DexNom Runtime (Experimental RT) to try ray tracing."
+Write-Host "Open DexNom Runtime from $ShortcutDirectory to play, or select DexNom Runtime (Compile shaders and play) to prepare the cache and start the game automatically."

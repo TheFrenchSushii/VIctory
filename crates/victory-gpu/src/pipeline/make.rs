@@ -49,7 +49,18 @@ pub(crate) struct Pending {
 
 /// Why a pipeline with these shaders is not made, if it is not.
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
-    if without_structures(shaders) {
+    // HostPipeline::new cannot make a mesh pipeline on this device.
+    // Do not queue it, wait for it, or put it in the early-start list.
+    // Keep the host's final capability guard in place as well.
+    if shaders.iter().any(|s| s.stage == "mesh")
+        && crate::host::host().is_some_and(|host| !host.mesh_shaders())
+    {
+        static WARNED: OnceLock<()> = OnceLock::new();
+        WARNED.get_or_init(|| {
+            tracing::warn!("Mesh shader pipelines are unavailable on this host; skipping their compilation (geometry may be missing)");
+        });
+        Some("mesh pipeline unsupported by host (no mesh shader or SM 6.6)")
+    } else if without_structures(shaders) {
         Some("shades ray-tracing hits, left out")
     } else if too_dear(shaders) {
         Some("too dear to compile, left out")
@@ -700,6 +711,22 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    #[test]
+    fn unsupported_pipeline_never_enters_worker_queue_or_early_list() {
+        let mut p = Pending::new(Vec::new(), None);
+        p.left_out = Some("mesh pipeline unsupported by host (no mesh shader or SM 6.6)");
+        p.key = "unsupported-mesh-test".to_owned();
+        let p = Arc::new(p);
+        early(&p);
+        assert!(ready(&p).is_none());
+        assert!(!now(&p));
+        assert_eq!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+        assert!(p.made.get().is_none());
+        assert!(!super::super::library::wanted_early(&p.key));
+        #[cfg(feature = "diagnostics")]
+        assert_eq!(missing(&p).as_deref(), p.left_out);
     }
 
     #[test]

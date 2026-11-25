@@ -1,19 +1,26 @@
 [CmdletBinding()]
 param(
     [string] $GamePath,
-    [string] $InstallDir = (Join-Path $env:LOCALAPPDATA 'DexNom Runtime'),
-    [string] $ShortcutDirectory = [Environment]::GetFolderPath('Programs')
+    [string] $InstallDir = (Join-Path $env:LOCALAPPDATA 'Sushi'),
+    [string] $ShortcutDirectory = (Join-Path ([Environment]::GetFolderPath('Programs')) 'Sushi')
 )
 
 $ErrorActionPreference = 'Stop'
 if ($env:OS -ne 'Windows_NT' -or ![Environment]::Is64BitOperatingSystem) {
-    throw 'DexNom Runtime requires 64-bit Windows.'
+    throw 'Sushi requires 64-bit Windows.'
 }
 if (!(Get-Command rustup -ErrorAction SilentlyContinue) -or !(Get-Command cargo -ErrorAction SilentlyContinue)) {
     throw 'Install Rust for Windows from https://rustup.rs, then reopen Setup.cmd.'
 }
 
 $InstallDir = [IO.Path]::GetFullPath($InstallDir)
+# Refuse a fresh default installation when the prior custom folder still
+# exists: preserve its cache, saves and saved game path during migration.
+$previous = Join-Path $env:LOCALAPPDATA ('VIctory ' + 'Pascal')
+$newDefault = Join-Path $env:LOCALAPPDATA 'Sushi'
+if ($InstallDir -ieq $newDefault -and !(Test-Path -LiteralPath $InstallDir) -and (Test-Path -LiteralPath $previous -PathType Container)) {
+    throw "Close the runtime and move the previous installation directory to $newDefault before running setup again, to preserve saves and shaders. Previous directory: $previous"
+}
 for ($parent = [IO.DirectoryInfo]::new($InstallDir); $parent; $parent = $parent.Parent) {
     if (Test-Path -LiteralPath (Join-Path $parent.FullName '.victory-root')) {
         throw 'Choose an install directory outside the source checkout so the launcher can write saves and shader caches.'
@@ -89,7 +96,7 @@ $state = [IO.Directory]::CreateDirectory((Join-Path $InstallDir 'state'))
 try {
     $lock = [IO.File]::Open((Join-Path $state.FullName 'launcher.lock'), 'OpenOrCreate', 'Write', 'None')
 } catch [IO.IOException] {
-    throw "Could not lock the install directory. Close DexNom Runtime and shader preload before updating. $($_.Exception.Message)"
+    throw "Could not lock the install directory. Close Sushi and shader preload before updating. $($_.Exception.Message)"
 }
 try {
     foreach ($name in 'victory.exe','victory-play.exe','victory-warm.exe') {
@@ -108,13 +115,13 @@ try {
 } finally { $lock.Dispose() }
 
 $launcher = Join-Path $InstallDir 'victory-play.exe'
-Write-Host "Installed DexNom Runtime in $InstallDir"
+Write-Host "Installed Sushi in $InstallDir"
 [IO.Directory]::CreateDirectory($ShortcutDirectory) | Out-Null
 $shell = New-Object -ComObject WScript.Shell
 foreach ($entry in @(
-    @{ Name = 'DexNom Runtime'; Arguments = ''; Target = $launcher }
-    @{ Name = 'DexNom Runtime (Compile shaders and play)'; Arguments = ''; Target = (Join-Path $InstallDir 'victory-warm.exe') }
-    @{ Name = 'DexNom Runtime (Experimental RT)'; Arguments = '--rt'; Target = $launcher }
+    @{ Name = 'Sushi'; Arguments = ''; Target = $launcher }
+    @{ Name = 'Sushi (Compile shaders and play)'; Arguments = ''; Target = (Join-Path $InstallDir 'victory-warm.exe') }
+    @{ Name = 'Sushi (Experimental RT)'; Arguments = '--rt'; Target = $launcher }
 )) {
     $shortcut = $shell.CreateShortcut((Join-Path $ShortcutDirectory ($entry.Name + '.lnk')))
     $shortcut.TargetPath = $entry.Target
@@ -122,4 +129,4 @@ foreach ($entry in @(
     $shortcut.WorkingDirectory = $InstallDir
     $shortcut.Save()
 }
-Write-Host "Open DexNom Runtime from $ShortcutDirectory to play, or select DexNom Runtime (Compile shaders and play) to prepare the cache and start the game automatically."
+Write-Host "Open Sushi from $ShortcutDirectory to play, or select Sushi (Compile shaders and play) to prepare the cache and start the game automatically."

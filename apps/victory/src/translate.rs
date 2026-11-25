@@ -496,22 +496,6 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
     Ok(())
 }
 
-#[cfg(test)]
-mod warm_progress_tests {
-    use super::warm_percent;
-
-    #[test]
-    fn candidate_percent_is_bounded_and_uses_the_actual_total() {
-        assert_eq!(warm_percent(0, 100), 0);
-        assert_eq!(warm_percent(1, 3), 33);
-        assert_eq!(warm_percent(2, 3), 66);
-        assert_eq!(warm_percent(3, 3), 100);
-        assert_eq!(warm_percent(4, 3), 100);
-        assert_eq!(warm_percent(0, 0), 100);
-        assert_eq!(warm_percent(usize::MAX, usize::MAX), 100);
-    }
-}
-
 fn translate(
     source: &Source,
     path: &Path,
@@ -988,4 +972,20 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod warm_progress_tests {
+    use super::warm_percent;
+
+    #[test]
+    fn candidate_percent_is_bounded_and_uses_the_actual_total() {
+        assert_eq!(warm_percent(0, 100), 0);
+        assert_eq!(warm_percent(1, 3), 33);
+        assert_eq!(warm_percent(2, 3), 66);
+        assert_eq!(warm_percent(3, 3), 100);
+        assert_eq!(warm_percent(4, 3), 100);
+        assert_eq!(warm_percent(0, 0), 100);
+        assert_eq!(warm_percent(usize::MAX, usize::MAX), 100);
+    }
 }

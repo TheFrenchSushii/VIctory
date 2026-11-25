@@ -1,7 +1,7 @@
 //! Fences: a 64-bit value and the events or callers waiting for it.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::ffi::c_void;
+use std::{collections::BTreeMap, ffi::c_void};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -33,6 +33,16 @@ struct Fence {
 enum Waiter {
     Event(usize),
     Blocking(std::sync::mpsc::Sender<()>),
+}
+
+/// Fences whose addresses the title can write from a command list.
+static GPU_ADDRESSES: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+impl Drop for Fence {
+    fn drop(&mut self) {
+        let mut addresses = GPU_ADDRESSES.lock().unwrap_or_else(|e| e.into_inner());
+        addresses.remove(&(&raw const self.value as usize));
+    }
 }
 
 fn fence<'a>(this: This) -> &'a Fence {
@@ -108,8 +118,13 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
 }
 /// Moves the fence to `value` and sets the events that waited for it.
 pub(crate) fn set(this: This, value: u64) {
+    update(this, |_| value);
+}
+
+fn update(this: This, value: impl FnOnce(u64) -> u64) {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
+    let value = value(fence.value.load(Ordering::Relaxed));
     fence.value.store(value, Ordering::Release);
     waiters.retain(|(wanted, waiter)| {
         if *wanted > value {
@@ -121,6 +136,31 @@ pub(crate) fn set(this: This, value: u64) {
         }
         false
     });
+}
+
+/// A bottom-of-pipe write into a fence updates it atomically and wakes its
+/// waiters. Dword writes preserve the other half of the value.
+pub(crate) fn write_gpu_address(address: usize, bytes: usize, value: u64) -> bool {
+    let base = address & !7;
+    let shift = ((address - base) * 8) as u32;
+    let mask = match (bytes, shift) {
+        (8, 0) => u64::MAX,
+        (4, 0 | 32) => u64::from(u32::MAX) << shift,
+        _ => return false,
+    };
+    let this = {
+        let addresses = GPU_ADDRESSES.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(&this) = addresses.get(&base) else { return false };
+        let this = this as This;
+        if !object::try_add_ref(this) {
+            tracing::warn!(address, "GPU write targeted a fence being destroyed");
+            return true;
+        }
+        this
+    };
+    update(this, |old| (old & !mask) | ((value << shift) & mask));
+    release(this);
+    true
 }
 pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     set(this, value);
@@ -135,7 +175,10 @@ extern "system" fn creation_flags(this: This) -> u32 {
 }
 /// Where the value lives (GPU addresses are CPU addresses).
 extern "system" fn gpu_address(this: This) -> u64 {
-    (&raw const fence(this).value) as u64
+    let address = &raw const fence(this).value as usize;
+    let mut addresses = GPU_ADDRESSES.lock().unwrap_or_else(|e| e.into_inner());
+    addresses.insert(address, this as usize);
+    address as u64
 }
 
 /// IUnknown 3, object 4, device child 1, fence 3, fence 1 (2, a console
@@ -189,6 +232,35 @@ mod tests {
         // SAFETY: ours.
         unsafe { CloseHandle(event) };
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_bottom_of_pipe_value_write_signals_fence_events() {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+
+        let mut f = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 1 << 32, 0, &FENCE_IIDS[0], &mut f), S_OK);
+        // SAFETY: a plain auto-reset event used only in this test.
+        let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+        assert!(!event.is_null());
+        let address = gpu_address(f) as *mut u8;
+        assert_eq!(set_event_on_completion(f, (1 << 32) + 7, event), S_OK);
+        crate::queue::Written::Value(6).write(address, 4);
+        assert_eq!(completed(f), (1 << 32) + 6);
+        // SAFETY: valid event until CloseHandle below.
+        assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_TIMEOUT);
+        crate::queue::Written::Value(7).write(address, 4);
+        assert_eq!(completed(f), (1 << 32) + 7);
+        // SAFETY: valid event until CloseHandle below.
+        assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
+        crate::queue::Written::Value(11).write(address, 8);
+        assert_eq!(completed(f), 11);
+        // SAFETY: this test owns the event.
+        assert_ne!(unsafe { CloseHandle(event) }, 0);
+        assert_eq!(release(f), 0);
+        assert!(!write_gpu_address(address as usize, 8, 0));
     }
 
     #[test]

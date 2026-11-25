@@ -99,19 +99,65 @@ try {
     throw "Could not lock the install directory. Close Sushi and shader preload before updating. $($_.Exception.Message)"
 }
 try {
-    foreach ($name in 'victory.exe','victory-play.exe','victory-warm.exe') {
-        $destination = Join-Path $InstallDir $name
-        $temp = Join-Path $InstallDir ([IO.Path]::GetRandomFileName())
-        try {
-            [IO.File]::Copy((Join-Path $release $name), $temp)
-            if ([IO.File]::Exists($destination)) {
-                [IO.File]::Replace($temp, $destination, [System.Management.Automation.Language.NullString]::Value)
-            } else {
-                [IO.File]::Move($temp, $destination)
+    $staged = @()
+    try {
+        foreach ($name in 'victory.exe','victory-play.exe','victory-warm.exe','game-path.txt') {
+            $entry = @{
+                Destination = Join-Path $InstallDir $name
+                Temporary = Join-Path $InstallDir ([IO.Path]::GetRandomFileName())
+                Backup = Join-Path $InstallDir ([IO.Path]::GetRandomFileName())
+                Published = $false
+                KeepBackup = $false
             }
-        } finally { if ([IO.File]::Exists($temp)) { [IO.File]::Delete($temp) } }
+            $staged += $entry
+            if ($name -eq 'game-path.txt') {
+                [IO.File]::WriteAllText($entry.Temporary, $game.FullName, [Text.UTF8Encoding]::new($false))
+            } else {
+                [IO.File]::Copy((Join-Path $release $name), $entry.Temporary)
+            }
+        }
+        foreach ($entry in $staged) {
+            if ([IO.File]::Exists($entry.Destination)) {
+                [IO.File]::Replace($entry.Temporary, $entry.Destination, $entry.Backup)
+            } else {
+                [IO.File]::Move($entry.Temporary, $entry.Destination)
+            }
+            $entry.Published = $true
+        }
+    } catch {
+        $installError = $_
+        $restoreErrors = @()
+        for ($i = $staged.Count - 1; $i -ge 0; $i--) {
+            $entry = $staged[$i]
+            try {
+                if ([IO.File]::Exists($entry.Backup)) {
+                    if ([IO.File]::Exists($entry.Destination)) {
+                        [IO.File]::Replace($entry.Backup, $entry.Destination, [System.Management.Automation.Language.NullString]::Value)
+                    } else {
+                        [IO.File]::Move($entry.Backup, $entry.Destination)
+                    }
+                } elseif ($entry.Published) {
+                    [IO.File]::Delete($entry.Destination)
+                }
+            } catch {
+                $entry.KeepBackup = $true
+                $restoreErrors += "$($entry.Destination) (backup: $($entry.Backup)): $($_.Exception.Message)"
+            }
+        }
+        if ($restoreErrors.Count -gt 0) {
+            throw "Installation failed: $($installError.Exception.Message)`nCould not fully restore the previous installation:`n$($restoreErrors -join "`n")"
+        }
+        throw $installError
+    } finally {
+        foreach ($entry in $staged) {
+            $cleanup = @($entry.Temporary)
+            if (!$entry.KeepBackup) { $cleanup += $entry.Backup }
+            foreach ($path in $cleanup) {
+                try { [IO.File]::Delete($path) }
+                catch { Write-Warning "Could not remove staged file '$path': $($_.Exception.Message)" }
+            }
+        }
     }
-    [IO.File]::WriteAllText($config, $game.FullName, [Text.UTF8Encoding]::new($false))
 } finally { $lock.Dispose() }
 
 $launcher = Join-Path $InstallDir 'victory-play.exe'

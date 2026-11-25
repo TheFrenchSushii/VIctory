@@ -719,6 +719,9 @@ impl Written {
             }
             Written::SystemTimestamp => system_timestamp(),
         };
+        if crate::fence::write_gpu_address(at as usize, bytes, value) {
+            return;
+        }
         // SAFETY: the title names writable GPU memory (unified with ours).
         unsafe {
             if bytes == 4 {

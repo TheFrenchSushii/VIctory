@@ -143,35 +143,21 @@ fn preload(
         root.display(),
         cache.display()
     )?;
-    println!(
+    let _ = writeln!(
+        std::io::stdout().lock(),
         "Preloading shaders and compute pipelines from {}\nLive log: {}",
         root.display(),
         path.display()
     );
-    let mut worker = child
+    // Give the worker a file rather than a pipe owned by the launcher.
+    // A broken console or an interrupted reader cannot panic its workers.
+    let status = child
         .arg("warm")
         .arg(root)
-        .stdout(Stdio::piped())
-        .spawn()
+        .stdout(log.try_clone()?)
+        .status()
         .context("Could not start DexNom Runtime shader preload")?;
-    let stdout = worker
-        .stdout
-        .take()
-        .context("Warmup output pipe is missing")?;
-    let last =
-        BufReader::new(stdout)
-            .lines()
-            .try_fold(None, |summary, line| -> anyhow::Result<_> {
-                let line = line?;
-                writeln!(log, "{line}")?;
-                let _ = writeln!(std::io::stdout().lock(), "{line}");
-                Ok(if line.starts_with("warm ") {
-                    Some(line)
-                } else {
-                    summary
-                })
-            });
-    let status = worker.wait()?;
+    let last = last_warm_summary(BufReader::new(File::open(path)?));
     writeln!(log, "VIctory exited with {status}")?;
     if status.success()
         && let Err(message) = check_warm_summary(last?.as_deref())
@@ -180,6 +166,18 @@ fn preload(
         bail!("{message}\n\nLog file\n{}", path.display());
     }
     Ok(status)
+}
+
+/// Read the last completed warmup summary from the append-only run log.
+fn last_warm_summary(reader: impl BufRead) -> std::io::Result<Option<String>> {
+    reader.lines().try_fold(None, |summary, line| {
+        let line = line?;
+        Ok(if line.starts_with("warm ") {
+            Some(line)
+        } else {
+            summary
+        })
+    })
 }
 
 /// The runtime prints this after saving its pipeline library. Preserve its exact
@@ -214,7 +212,17 @@ pub(super) fn show_error(text: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::check_warm_summary;
+    use super::{check_warm_summary, last_warm_summary};
+
+    #[test]
+    fn warm_summary_survives_interleaved_log_messages() {
+        let log = b"scan\nwarm  1 translated\nINFO saved cache\nwarm  2 translated\nexit\n";
+        assert_eq!(
+            last_warm_summary(&log[..]).unwrap().as_deref(),
+            Some("warm  2 translated")
+        );
+        assert!(last_warm_summary(&b"scan only\n"[..]).unwrap().is_none());
+    }
 
     #[test]
     fn empty_and_incomplete_scans_are_reported() {

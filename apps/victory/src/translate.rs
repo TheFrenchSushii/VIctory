@@ -2,6 +2,7 @@
 //! what it cannot handle yet is tallied (decision 0003).
 
 use std::collections::{BTreeMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -159,6 +160,7 @@ pub fn run(
     list: bool,
     jobs: Option<usize>,
 ) -> Result<()> {
+    anyhow::ensure!(jobs != Some(0), "--jobs must be at least 1");
     let paths = crate::default_paths(paths)?;
     // `VICTORY_HOST_MAX_WAVE=32`: translate as for a host whose waves have
     // at most 32 lanes (as the runtime does on such a card).
@@ -196,10 +198,16 @@ pub fn run(
             if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
                 continue;
             }
+            if entry.metadata().is_ok_and(|m| m.len() >= 8 * 1024 * 1024) {
+                tracing::info!(path = %entry.path().display(), "scanning shader archive");
+            }
             let Ok(data) = std::fs::read(entry.path()) else {
                 continue;
             };
             let jobs = sources(&data);
+            if !jobs.is_empty() {
+                tracing::info!(path = %entry.path().display(), candidates = jobs.len(), "shader candidates found");
+            }
             let next = AtomicUsize::new(0);
             std::thread::scope(|s| {
                 for _ in 0..threads.min(jobs.len()) {
@@ -308,6 +316,7 @@ pub fn run(
 
 /// `victory warm`: fills the caches a run reads (`Command::Warm`).
 pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result<()> {
+    anyhow::ensure!(jobs != Some(0), "--jobs must be at least 1");
     let paths = crate::default_paths(paths)?;
     let cfg = victory_core::Config::load()?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
@@ -320,10 +329,16 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
             if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
                 continue;
             }
+            if entry.metadata().is_ok_and(|m| m.len() >= 8 * 1024 * 1024) {
+                tracing::info!(path = %entry.path().display(), "scanning shader archive");
+            }
             let Ok(data) = std::fs::read(entry.path()) else {
                 continue;
             };
             let jobs = sources(&data);
+            if !jobs.is_empty() {
+                tracing::info!(path = %entry.path().display(), candidates = jobs.len(), "shader candidates found");
+            }
             let next = AtomicUsize::new(0);
             std::thread::scope(|s| {
                 for _ in 0..threads.min(jobs.len()) {
@@ -358,7 +373,13 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                                 None => 0,
                             };
                             if n.is_multiple_of(2000) {
-                                println!("{:6.0} s  {n} shaders", started.elapsed().as_secs_f64());
+                                // A closed console or log must not panic a worker.
+                                tracing::info!(
+                                    seconds = started.elapsed().as_secs(),
+                                    translated = done.load(Ordering::Relaxed),
+                                    refused = refused.load(Ordering::Relaxed),
+                                    "shader warmup progress"
+                                );
                             }
                         }
                     });
@@ -367,14 +388,15 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
         }
     }
     victory_hle::modules::d3d12x::save_pipeline_cache();
-    println!(
+    writeln!(
+        std::io::stdout().lock(),
         "warm         {} translated, {} refused; {} compute pipelines, {} refused; {:.0} s",
         done.into_inner(),
         refused.into_inner(),
         made.into_inner(),
         unmade.into_inner(),
         started.elapsed().as_secs_f64()
-    );
+    )?;
     Ok(())
 }
 

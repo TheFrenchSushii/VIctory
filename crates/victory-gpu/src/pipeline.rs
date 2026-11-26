@@ -573,7 +573,7 @@ fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
 
 fn hand_out(
     shaders: Vec<Arc<Shader>>,
-    #[cfg(windows)] graphics: Option<Box<host::GraphicsState>>,
+    #[cfg(windows)] graphics: Option<Arc<host::GraphicsState>>,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
@@ -717,8 +717,28 @@ pub(crate) extern "system" fn create_stream(
         // SAFETY: the title passes room for an output object pointer.
         unsafe { out.write(std::ptr::null()) };
     }
+    let stream = match read_stream(desc) {
+        Ok(stream) => stream,
+        Err(error) => return error,
+    };
+    hand_out(
+        stream.shaders,
+        #[cfg(windows)]
+        Some(stream.graphics),
+        iid,
+        out,
+    )
+}
+
+struct StreamParts {
+    shaders: Vec<Arc<Shader>>,
+    #[cfg(windows)]
+    graphics: Arc<host::GraphicsState>,
+}
+
+fn read_stream(desc: &StreamDesc) -> Result<StreamParts, HRESULT> {
     if desc.stream.is_null() || desc.size == 0 || desc.size > isize::MAX as usize || !desc.size.is_multiple_of(8) {
-        return E_INVALIDARG;
+        return Err(E_INVALIDARG);
     }
     let mut shaders = Vec::new();
     #[cfg(windows)]
@@ -737,7 +757,7 @@ pub(crate) extern "system" fn create_stream(
         };
         if size > desc.size - at {
             tracing::warn!(kind, at, size, remaining = desc.size - at, "truncated pipeline subobject");
-            return E_INVALIDARG;
+            return Err(E_INVALIDARG);
         }
         if let Some(stage) = stage {
             // SAFETY: the complete shader subobject is within the stream.
@@ -750,19 +770,17 @@ pub(crate) extern "system" fn create_stream(
         // SAFETY: a whole subobject of this kind lies at `at`.
         if !unsafe { graphics.read(kind, desc.stream.add(at)) } {
             tracing::warn!(kind, at, "invalid graphics pipeline subobject");
-            return E_INVALIDARG;
+            return Err(E_INVALIDARG);
         }
         at += size;
     }
     #[cfg(windows)]
     graphics.apply_integer_blend_bypass();
-    hand_out(
+    Ok(StreamParts {
         shaders,
         #[cfg(windows)]
-        Some(Box::new(graphics)),
-        iid,
-        out,
-    )
+        graphics: Arc::new(graphics),
+    })
 }
 
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
@@ -791,9 +809,9 @@ mod make;
 #[cfg(windows)]
 mod xbox_cache;
 #[cfg(windows)]
-pub use xbox_cache::CachedCompute;
+pub use xbox_cache::{CachedCompute, CachedGraphics};
 #[cfg(windows)]
-pub(crate) use xbox_cache::create_cached_compute;
+pub(crate) use xbox_cache::{create_cached_compute, create_cached_graphics};
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.

@@ -34,7 +34,7 @@ use super::host::{GraphicsState, HostPipeline};
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
-    pub(crate) graphics: Option<Box<GraphicsState>>,
+    pub(crate) graphics: Option<Arc<GraphicsState>>,
     queue_state: AtomicU8,
     made: OnceLock<Option<HostPipeline>>,
     /// What identifies it across runs (shader containers and state), and
@@ -114,7 +114,7 @@ unsafe impl Send for Pending {}
 unsafe impl Sync for Pending {}
 
 impl Pending {
-    pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
+    pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Arc<GraphicsState>>) -> Pending {
         let mut key = blake3::Hasher::new();
         for s in &shaders {
             key.update(s.stage.as_bytes());
@@ -771,11 +771,11 @@ mod tests {
     fn early_depth_precedes_other_prewarming_and_requests_precede_both() {
         use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D32_FLOAT;
         let depth_pipeline = || {
-            let mut depth = Box::new(GraphicsState::default());
+            let mut depth = GraphicsState::default();
             let format = [16u32, DXGI_FORMAT_D32_FLOAT.0 as u32];
             // SAFETY: a complete depth-format subobject of the title pipeline stream.
             unsafe { depth.read(16, format.as_ptr().cast()) };
-            Arc::new(Pending::new(Vec::new(), Some(depth)))
+            Arc::new(Pending::new(Vec::new(), Some(Arc::new(depth))))
         };
         let normal = Arc::new(Pending::new(Vec::new(), None));
         let promoted = depth_pipeline();

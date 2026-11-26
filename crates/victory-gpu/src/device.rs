@@ -401,6 +401,14 @@ extern "system" fn cached_compute(this: This, desc: *const u8, iid: *const Iid, 
     unknown_pipeline::<0x218>(this, desc, iid, out)
 }
 
+extern "system" fn cached_graphics(this: This, desc: *const u8, iid: *const Iid, out: *mut This) -> HRESULT {
+    #[cfg(windows)]
+    if let Some(hr) = pipeline::create_cached_graphics(desc, iid, out) {
+        return hr;
+    }
+    unknown_pipeline::<0x1c8>(this, desc, iid, out)
+}
+
 /// IUnknown 3, object methods 4, device methods 76 (0x18-0x290), then the
 /// methods `ID3D12Device1` to `ID3D12Device8` add, in order: 3, 1, 3, 6, 9,
 /// 1, 2, 9 (0x298-0x3a0, the console's own among them), then those of
@@ -437,7 +445,7 @@ static FUNCTIONS: Table<160> = {
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
     f[48] = queue::create_x as *const (); // 0x180
-    f[57] = unknown_pipeline::<0x1c8> as *const (); // 0x1c8
+    f[57] = cached_graphics as *const (); // 0x1c8
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
     f[67] = cached_compute as *const (); // 0x218

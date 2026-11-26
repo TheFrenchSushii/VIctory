@@ -106,8 +106,8 @@ pub fn run(
         println!("not executing (pass --execute to start the title)");
         return Ok(());
     }
-    if let Err(error) = load_cached_compute(&title_dir.join("shaders.rpf")) {
-        tracing::warn!(%error, "Xbox compute pipeline catalog unavailable");
+    if let Err(error) = crate::xbox_pipelines::load(&title_dir.join("shaders.rpf")) {
+        tracing::warn!(%error, "Xbox pipeline catalog unavailable");
     }
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
@@ -132,50 +132,6 @@ pub fn run(
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     anyhow::ensure!(code == 0, "Title exited with code {code:#010x}");
     println!("title exited with {code}");
-    Ok(())
-}
-
-#[cfg(windows)]
-fn load_cached_compute(path: &Path) -> Result<()> {
-    use std::collections::HashMap;
-    use std::io::Read;
-    use victory_game::{sgd5, shaderpack};
-    use victory_hle::modules::d3d12x::CachedCompute;
-
-    let file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error).with_context(|| format!("opening {}", path.display())),
-    };
-    let limit = crate::shader::MAX_FILE;
-    anyhow::ensure!(file.metadata()?.len() <= limit, "shader archive exceeds the scan limit");
-    let mut archive = Vec::new();
-    file.take(limit + 1).read_to_end(&mut archive)?;
-    anyhow::ensure!(archive.len() as u64 <= limit, "shader archive exceeds the scan limit");
-
-    let packed = shaderpack::find(&archive).context("Xbox pipeline pack not found")?;
-    let pack = shaderpack::Pack::parse(&packed).map_err(anyhow::Error::msg)?;
-    let mut shaders: HashMap<u64, Vec<sgd5::Record<'_>>> = HashMap::new();
-    for [_, _, _, _, _, compute] in sgd5::databases(&archive).into_iter().map(|db| db.shaders) {
-        for shader in compute {
-            shaders.entry(shader.hash).or_default().push(shader.record);
-        }
-    }
-    let mut catalog = CachedCompute::default();
-    let mut total = 0;
-    for entry in pack.compute() {
-        total += 1;
-        let Some((records, layout)) = shaders.get(&entry.shader_hash).zip(entry.stage.metadata) else {
-            continue;
-        };
-        for record in records {
-            if let Some(bytes) = record.unpack() {
-                catalog.insert([entry.packet, entry.metadata, entry.stage.program, layout], bytes);
-            }
-        }
-    }
-    let usable = catalog.install().map_err(anyhow::Error::msg)?;
-    tracing::info!(usable, total, "Xbox compute pipelines indexed from the title's shader archive");
     Ok(())
 }
 

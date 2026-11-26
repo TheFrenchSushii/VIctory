@@ -35,6 +35,12 @@ pub(crate) struct GraphicsState {
     samples: DXGI_SAMPLE_DESC,
 }
 
+// SAFETY: the pointers in `inputs` target owned, immutable C strings in
+// `names`. Moving the state does not move those string allocations.
+unsafe impl Send for GraphicsState {}
+// SAFETY: changing the input layout requires exclusive access to the state.
+unsafe impl Sync for GraphicsState {}
+
 impl Default for GraphicsState {
     fn default() -> Self {
         let target = D3D12_RENDER_TARGET_BLEND_DESC {

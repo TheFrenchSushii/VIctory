@@ -147,15 +147,15 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
 
     if warm {
         let _ = writeln!(std::io::stdout().lock(), "Checking existing shader cache...");
-        let marker = cache.join("warmup-complete-v1.txt");
+        let marker = cache.join(WARM_MARKER);
         let fingerprint = warm_fingerprint(root, &runtime, rt, warp, performance);
         let mut ready = false;
         if !force_warm {
             match &fingerprint {
                 Ok(key) => match verify_warm_marker(&cache, key) {
-                    Ok(count) => {
+                    Ok((count, summary)) => {
                         ready = true;
-                        let _ = writeln!(std::io::stdout().lock(), "Previous warmup verified: {count} recorded shader cache entries still present. Skipping archive scan and compilation.");
+                        let _ = writeln!(std::io::stdout().lock(), "Previous warmup verified: {count} recorded shader cache entries still present. Skipping archive scan and compilation.\nPrevious results: {summary}");
                     }
                     Err(error) => {
                         let _ = writeln!(std::io::stdout().lock(), "Cache requires warmup: {error:#}");
@@ -178,15 +178,14 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
             let (path, mut log) = open_run_log(&logs, "warm", started, &runtime, &game, rt, warp)?;
             let mut child = command();
             child.stderr(log.try_clone()?);
-            let status = preload(&mut child, &game, &cache, &path, &mut log)?;
-            require_success(status, &path)?;
+            let summary = preload(&mut child, &game, &cache, &path, &mut log)?;
             // Cache readiness is only recorded for a finished, readable scan
             // of an unchanged game installation and a populated shader cache.
             let result = (|| -> anyhow::Result<()> {
                 let before = fingerprint?;
                 let after = warm_fingerprint(root, &runtime, rt, warp, performance)?;
                 anyhow::ensure!(before == after, "Game files or runtime changed during warmup");
-                write_warm_marker(&cache, &after, started)
+                write_warm_marker(&cache, &after, started, &summary)
             })();
             if let Err(error) = result {
                 writeln!(log, "Warmup success marker not recorded: {error:#}")?;
@@ -234,7 +233,7 @@ fn warm_fingerprint(root: &Path, runtime: &Path, rt: bool, warp: bool, performan
     }
 
     let mut hash = blake3::Hasher::new();
-    field(&mut hash, b"victory-warm-marker-v1");
+    field(&mut hash, b"victory-warm-marker-v2");
     field(&mut hash, fs::canonicalize(root)?.as_os_str().as_encoded_bytes());
     field(&mut hash, &[u8::from(rt), u8::from(warp), u8::from(performance)]);
     // Hash the actual installed runtime, not just its package version.
@@ -314,7 +313,9 @@ fn has_pipeline_library(cache: &Path) -> bool {
     })
 }
 
-fn marker_entries<'a>(text: &'a str, fingerprint: &str, library_present: bool) -> anyhow::Result<BTreeSet<&'a str>> {
+const WARM_MARKER: &str = "warmup-complete-v2.txt";
+
+fn marker_entries<'a>(text: &'a str, fingerprint: &str, library_present: bool) -> anyhow::Result<(&'a str, BTreeSet<&'a str>)> {
     let mut lines = text.lines();
     anyhow::ensure!(lines.next() == Some(fingerprint), "Game, runtime or settings changed");
     match lines.next() {
@@ -322,28 +323,30 @@ fn marker_entries<'a>(text: &'a str, fingerprint: &str, library_present: bool) -
         Some("pipeline=0") => {},
         _ => bail!("Invalid warmup marker"),
     }
+    let summary = check_warm_summary(lines.next()).map_err(anyhow::Error::msg)?;
     let entries: BTreeSet<_> = lines.collect();
     anyhow::ensure!(!entries.is_empty(), "Warmup marker has no shader entries");
-    Ok(entries)
+    Ok((summary, entries))
 }
 
-fn verify_warm_marker(cache: &Path, fingerprint: &str) -> anyhow::Result<usize> {
-    let text = fs::read_to_string(cache.join("warmup-complete-v1.txt"))
+fn verify_warm_marker(cache: &Path, fingerprint: &str) -> anyhow::Result<(usize, String)> {
+    let text = fs::read_to_string(cache.join(WARM_MARKER))
         .context("No verified completion marker; one warmup is needed")?;
-    let expected = marker_entries(&text, fingerprint, has_pipeline_library(cache))?;
+    let (summary, expected) = marker_entries(&text, fingerprint, has_pipeline_library(cache))?;
     let current = shader_inventory(cache)?;
     anyhow::ensure!(expected.iter().all(|entry| current.contains(*entry)), "Recorded shader cache entries are missing or modified");
-    Ok(expected.len())
+    Ok((expected.len(), summary.to_owned()))
 }
 
-fn write_warm_marker(cache: &Path, fingerprint: &str, started: u128) -> anyhow::Result<()> {
+fn write_warm_marker(cache: &Path, fingerprint: &str, started: u128, summary: &str) -> anyhow::Result<()> {
     let entries = shader_inventory(cache)?;
     let temporary = cache.join(format!(".warmup-marker-{started}-{}.tmp", std::process::id()));
-    let marker = cache.join("warmup-complete-v1.txt");
+    let marker = cache.join(WARM_MARKER);
     let result = (|| -> anyhow::Result<()> {
         let mut file = OpenOptions::new().write(true).create_new(true).open(&temporary)?;
         writeln!(file, "{fingerprint}")?;
         writeln!(file, "pipeline={}", u8::from(has_pipeline_library(cache)))?;
+        writeln!(file, "{summary}")?;
         for entry in entries { writeln!(file, "{entry}")?; }
         file.sync_all()?;
         drop(file);
@@ -462,7 +465,7 @@ fn preload(
     cache: &Path,
     path: &Path,
     log: &mut File,
-) -> anyhow::Result<ExitStatus> {
+) -> anyhow::Result<String> {
     let root = game.parent().context("Game install folder is missing")?;
     writeln!(
         log,
@@ -495,19 +498,21 @@ fn preload(
         }
     };
     writeln!(log, "VIctory exited with {status}")?;
-    if status.success() {
-        let summary = last_warm_summary(BufReader::new(File::open(path)?))?;
-        if let Err(message) = check_warm_summary(summary.as_deref()) {
+    require_success(status, path)?;
+    let summary = last_warm_summary(BufReader::new(File::open(path)?))?;
+    let summary = match check_warm_summary(summary.as_deref()) {
+        Ok(summary) => summary,
+        Err(message) => {
             writeln!(log, "{message}")?;
             bail!("{message}\n\nLog file\n{}", path.display());
         }
-        if !warm_scan_complete(BufReader::new(File::open(path)?))? {
-            let message = "Warmup reported inaccessible files or an incomplete scan";
-            writeln!(log, "{message}")?;
-            bail!("{message}\n\nLog file\n{}", path.display());
-        }
+    };
+    if !warm_scan_complete(BufReader::new(File::open(path)?))? {
+        let message = "Warmup reported inaccessible files or an incomplete scan";
+        writeln!(log, "{message}")?;
+        bail!("{message}\n\nLog file\n{}", path.display());
     }
-    Ok(status)
+    Ok(summary.to_owned())
 }
 
 /// Only display concise progress records in the console. Full diagnostics
@@ -583,20 +588,26 @@ fn last_warm_summary(reader: impl BufRead) -> std::io::Result<Option<String>> {
 
 /// The runtime prints this after saving its pipeline library. Preserve its exact
 /// counters in the log, including partial refusal; an empty scan is not a preload.
-fn check_warm_summary(summary: Option<&str>) -> Result<(), &'static str> {
+fn check_warm_summary(summary: Option<&str>) -> Result<&str, &'static str> {
     let Some(summary) = summary else {
         return Err("VIctory did not report a shader warmup result");
     };
     let mut words = summary.split_whitespace();
-    if words.next() != Some("warm")
-        || words
-            .next()
-            .and_then(|s| s.parse::<u64>().ok())
-            .is_none_or(|n| n == 0)
-    {
+    let fields = std::array::from_fn(|_| words.next());
+    let [Some("warm"), Some(translated), Some("translated,"), Some(refused), Some("refused;"),
+        Some(pipelines), Some("compute"), Some("pipelines,"), Some(pipeline_refused), Some("refused;"),
+        Some(seconds), Some("s"), None] = fields else {
+        return Err("VIctory reported an invalid shader warmup result");
+    };
+    if translated.parse::<u64>().ok().is_none_or(|n| n == 0) {
         return Err("No shaders successfully translated. See the runtime totals in the log");
     }
-    Ok(())
+    if [refused, pipelines, pipeline_refused].into_iter().any(|n| n.parse::<u64>().is_err())
+        || seconds.parse::<u64>().is_err()
+    {
+        return Err("VIctory reported invalid shader warmup counters");
+    }
+    Ok(summary)
 }
 
 #[allow(dead_code)] // the console warmer reports errors to stderr
@@ -617,12 +628,16 @@ mod tests {
 
     #[test]
     fn warm_marker_requires_matching_fingerprint_and_recorded_pipeline() {
-        let marker = "abc\npipeline=1\n00/entry 100 20 0\n";
-        assert_eq!(marker_entries(marker, "abc", true).unwrap().len(), 1);
-        assert!(marker_entries(marker, "different", true).is_err());
-        assert!(marker_entries(marker, "abc", false).is_err());
+        let summary = "warm  1 translated, 2 refused; 3 compute pipelines, 4 refused; 5 s";
+        let marker = format!("abc\npipeline=1\n{summary}\n00/entry 100 20 0\n");
+        let (previous, entries) = marker_entries(&marker, "abc", true).unwrap();
+        assert_eq!(previous, summary);
+        assert_eq!(entries.len(), 1);
+        assert!(marker_entries(&marker, "different", true).is_err());
+        assert!(marker_entries(&marker, "abc", false).is_err());
         assert!(marker_entries("abc\npipeline=0\n", "abc", false).is_err());
-        assert!(marker_entries("abc\npipeline=0\nentry\n", "abc", false).is_ok());
+        assert!(marker_entries("abc\npipeline=0\nentry\n", "abc", false).is_err());
+        assert!(marker_entries(&format!("abc\npipeline=0\n{summary}\nentry\n"), "abc", false).is_ok());
     }
 
     #[test]
@@ -688,6 +703,7 @@ mod tests {
     #[test]
     fn empty_and_incomplete_scans_are_reported() {
         assert!(check_warm_summary(None).is_err());
+        assert!(check_warm_summary(Some("warm  1 translated")).is_err());
         assert!(
             check_warm_summary(Some(
                 "warm  0 translated, 0 refused; 0 compute pipelines, 0 refused; 0 s"

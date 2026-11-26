@@ -29,6 +29,8 @@ pub(super) mod intersect;
 mod guest_address;
 #[path = "group_lds.rs"]
 mod group_lds;
+#[path = "ordered_pixel.rs"]
+mod ordered_pixel;
 #[path = "packed_mask.rs"]
 mod packed_mask;
 #[path = "typed_views.rs"]
@@ -265,6 +267,7 @@ struct Lower<'a> {
     /// and does not wait for the group ([`super::group_sync`]).
     fence_only: HashSet<usize>,
     portable_lds: bool,
+    ordered_pixel: Option<ordered_pixel::OrderedPixel>,
     /// A group barrier before each LDS access when a console wave spans host waves.
     split_lds: bool,
     /// With `split_lds`, LDS accesses in lane branches: per IR block whether every lane runs
@@ -1550,6 +1553,8 @@ impl<'a> Lower<'a> {
             src0: None,
             console_lanes,
             portable_lds,
+            ordered_pixel: (x.native.stage == HwStage::Ps && !partial)
+                .then(|| ordered_pixel::OrderedPixel::recognize(p)).flatten(),
             split_lds,
             lds_meet,
             local: exchange.is_some() && LOCAL_WAVES.get(),
@@ -2321,6 +2326,9 @@ impl<'a> Lower<'a> {
                 }
                 Reg::S(n) => match io_inputs.get(&v) {
                     Some(&input) => self.input(input),
+                    None if self.ordered_pixel.as_ref().is_some_and(|r| r.overlap == v) => {
+                        Val::I32(self.s.m.i32(0))
+                    }
                     // Above the SGPRs the hardware initializes, a register
                     // holds what the last wave left, so no program depends
                     // on it: a read the paths only seem to allow (a branch
@@ -3244,6 +3252,8 @@ impl<'a> Lower<'a> {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
                 self.i32_of(v)
             }
+            Operand::Const(ordered_pixel::EXITING_WAVE)
+                if self.ordered_pixel.as_ref().is_some_and(|r| r.polls.contains(&inst.machine.offset)) => Ok(self.s.m.i32(0)),
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
@@ -4848,7 +4858,8 @@ impl<'a> Lower<'a> {
             // each host wave answers for itself.
             MaskData::None => self.uniform_test(inst),
         };
-        let effect = matches!(inst.fields, Fields::Exp { .. })
+        let effect = self.ordered_image((b, i))
+            || matches!(inst.fields, Fields::Exp { .. })
             || matches!(inst.fields, Fields::Flat { .. }) && !name.starts_with("global_load_")
             || name.contains("store")
             || name.contains("atomic")
@@ -9495,7 +9506,8 @@ impl<'a> Lower<'a> {
                 .is_some_and(|u| u.kind == ResourceType::Uav);
         let uint = !uav && !*d16 && *dmask == 1
             && matches!(name, "image_load" | "image_gather4_lz") && self.scalar_uint_srv(src, kind);
-        let props = (kind | if uav { 0x1000 } else { 0 }, if uint { 0x105 } else { 0x409 });
+        let shape = self.ordered_shape(site, kind | if uav { 0x1000 } else { 0 }, uav)?;
+        let props = (shape, if uint { 0x105 } else { 0x409 });
         if let Some(op) = name.strip_prefix("image_atomic_") {
             // GLC returns the old value. DXIL implements subtraction by adding
             // the two's complement of the operand at the same width.
@@ -11041,12 +11053,13 @@ impl<'a> Lower<'a> {
                 not_taken,
             } => {
                 // A negated condition branches the other way round.
-                let (cond, taken, not_taken) = match self.x.st.bools.node(when) {
-                    _ if self.x.st.wide.contains(&b) => {
+                let (cond, taken, not_taken) = match (self.ordered_branch(b, taken, not_taken), self.x.st.bools.node(when)) {
+                    (Some(c), _) => (c, taken, not_taken),
+                    (_, _) if self.x.st.wide.contains(&b) => {
                         let c = self.wave_wide(b, when).map_err(|w| unsupported(offset, w))?;
                         (c, taken, not_taken)
                     }
-                    Some((atom, Bool::TRUE, Bool::FALSE)) => {
+                    (_, Some((atom, Bool::TRUE, Bool::FALSE))) => {
                         let a = self
                             .atom(atom, self.cur)
                             .map_err(|w| unsupported(offset, w))?;

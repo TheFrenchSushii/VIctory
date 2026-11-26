@@ -71,6 +71,7 @@ translation_inputs! {
     "emit/threading.rs",
     "emit/typed_views.rs",
     "emit/group_lds.rs",
+    "emit/ordered_pixel.rs",
     "emit/validator.rs",
     "emit/wave.rs",
     "gfx10/fields.rs",

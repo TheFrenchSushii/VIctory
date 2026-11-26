@@ -164,9 +164,7 @@ pub fn run(
     let paths = crate::default_paths(paths)?;
     // `VICTORY_HOST_MAX_WAVE=32`: translate as for a host whose waves have
     // at most 32 lanes (as the runtime does on such a card).
-    if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE").ok().and_then(|v| v.parse().ok()) {
-        victory_shader::emit::set_host_max_wave(n);
-    }
+    let wave_override = std::env::var("VICTORY_HOST_MAX_WAVE").ok().and_then(|v| v.parse().ok());
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
         Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
@@ -178,7 +176,14 @@ pub fn run(
     }
     let warp = std::env::var_os("VICTORY_D3D12_WARP").is_some();
     if pipelines {
-        Host::new(warp).map_err(anyhow::Error::msg)?;
+        let host = Host::new(warp).map_err(anyhow::Error::msg)?;
+        let wave = match wave_override {
+            Some(wave) => wave,
+            None => host.max_wave().map_err(anyhow::Error::msg)?,
+        };
+        victory_shader::emit::set_host_max_wave(wave);
+    } else if let Some(wave) = wave_override {
+        victory_shader::emit::set_host_max_wave(wave);
     }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()

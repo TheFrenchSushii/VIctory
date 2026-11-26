@@ -27,6 +27,8 @@ pub(super) mod intersect;
 
 #[path = "guest_address.rs"]
 mod guest_address;
+#[path = "group_lds.rs"]
+mod group_lds;
 #[path = "packed_mask.rs"]
 mod packed_mask;
 #[path = "typed_views.rs"]
@@ -262,7 +264,8 @@ struct Lower<'a> {
     /// loop a lane can be cut out of): the barrier there keeps its fences
     /// and does not wait for the group ([`super::group_sync`]).
     fence_only: HashSet<usize>,
-    /// A group barrier before every LDS access (a console wave run as two host waves).
+    portable_lds: bool,
+    /// A group barrier before each LDS access when a console wave spans host waves.
     split_lds: bool,
     /// With `split_lds`, LDS accesses in lane branches: per IR block whether every lane runs
     /// it, and whether the host waves meet at its start and before its exit ([`lds_meetings`]).
@@ -1275,7 +1278,7 @@ impl<'a> Lower<'a> {
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
         let mut console_lanes = false;
-        // LDS accesses get a group barrier each (a console wave split in two host waves)
+        let mut portable_lds = false;
         let mut split_lds = false;
         // with `split_lds`, LDS accesses in lane branches: the blocks every lane runs, and
         // where the host waves meet around those branches (`lds_meetings`)
@@ -1326,16 +1329,7 @@ impl<'a> Lower<'a> {
                 if !crosses && (s.lds_dwords == 0 || group <= 32) {
                     wave = 32;
                 } else {
-                    // (Groups of several console waves too: each console wave is two host
-                    // waves, which exchange through their own pair of dwords.)
-                    // LDS the console shares within its one wave without barriers: split into
-                    // two waves of 32, a group barrier before every LDS access keeps their order
-                    // – where every thread of the group gets there (no lane branch around it,
-                    // no guard), else a barrier would hang the group
-                    let lds = |i: &Inst| {
-                        matches!(i.fields, Fields::Ds { .. })
-                            && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
-                    };
+                    let lds = group_lds::access;
                     if let Some(all) = all_lane_blocks(x.st) {
                         let ok = p.blocks.iter().enumerate().all(|(b, blk)| {
                             blk.insts.iter().all(|inst| {
@@ -1415,6 +1409,8 @@ impl<'a> Lower<'a> {
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
             }
+            portable_lds = !console_lanes && one_wave && s.lds_dwords > 0
+                && group_lds::portable(group, wave, x.st);
         }
         // The title's barriers a thread of the group may never reach, which
         // leaves the others waiting on the host: those in blocks some lanes
@@ -1553,6 +1549,7 @@ impl<'a> Lower<'a> {
             writes_uavs,
             src0: None,
             console_lanes,
+            portable_lds,
             split_lds,
             lds_meet,
             local: exchange.is_some() && LOCAL_WAVES.get(),
@@ -2280,6 +2277,9 @@ impl<'a> Lower<'a> {
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
+        if self.portable_lds && self.s.flags & flags::WAVE_OPS == 0 {
+            self.s.wave_size = None;
+        }
         let wave_size = self.s.wave_size;
         Ok(Lowered {
             wave_size,
@@ -4857,17 +4857,7 @@ impl<'a> Lower<'a> {
                 && !(name.starts_with("ds_read")
                     || name.starts_with("ds_swizzle")
                     || name.contains("permute"));
-        if self.split_lds
-            && matches!(inst.fields, Fields::Ds { .. })
-            && !(name.starts_with("ds_swizzle") || name.contains("permute"))
-            && self.lds_meet.as_ref().is_none_or(|(all, _)| all[b])
-        {
-            // the two host waves of a console wave meet before each LDS access: what the other
-            // half wrote is visible, and what it still reads is not overwritten
-            let mode = self.s.m.i32(meeting_mode());
-            let void = self.s.t.void;
-            self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
-        }
+        self.sync_lds(inst, b);
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),

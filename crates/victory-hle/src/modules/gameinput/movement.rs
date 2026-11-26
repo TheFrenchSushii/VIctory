@@ -1,5 +1,7 @@
 //! Diagnostic stand-in pad commands. Replace the local file with one line
-//! `<sequence> <W|A|S|D|I|J|K|L> <hold_ms>`. Only increasing sequences run.
+//! `<sequence> <control> <hold_ms>`. Controls are stick directions (`W`, `A`,
+//! `S`, `D`, `I`, `J`, `K`, `L`) or named Xbox buttons (`PadA`, `Menu`, ...).
+//! Only increasing sequences run.
 
 use std::io::Read;
 use std::path::Path;
@@ -7,11 +9,54 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use super::PadState;
+use super::{
+    A, B, DOWN, LEFT, LEFT_SHOULDER, LEFT_STICK, MENU, PadState, RIGHT, RIGHT_SHOULDER,
+    RIGHT_STICK, UP, VIEW, X, Y,
+};
+
+const BUTTONS: [(&str, u32); 14] = [
+    ("PadA", A),
+    ("PadB", B),
+    ("PadX", X),
+    ("PadY", Y),
+    ("Menu", MENU),
+    ("View", VIEW),
+    ("DpadUp", UP),
+    ("DpadDown", DOWN),
+    ("DpadLeft", LEFT),
+    ("DpadRight", RIGHT),
+    ("LB", LEFT_SHOULDER),
+    ("RB", RIGHT_SHOULDER),
+    ("LS", LEFT_STICK),
+    ("RS", RIGHT_STICK),
+];
+
+enum Control {
+    Stick(u8),
+    Button(&'static str, u32),
+}
+
+impl Control {
+    fn parse(text: &str) -> Option<Self> {
+        if let [key @ (b'W' | b'A' | b'S' | b'D' | b'I' | b'J' | b'K' | b'L')] = *text.as_bytes() {
+            return Some(Self::Stick(key));
+        }
+        BUTTONS
+            .iter()
+            .find_map(|&(name, bit)| (text == name).then_some(Self::Button(name, bit)))
+    }
+
+    fn label(&self) -> std::borrow::Cow<'static, str> {
+        match *self {
+            Self::Stick(key) => char::from(key).to_string().into(),
+            Self::Button(name, _) => name.into(),
+        }
+    }
+}
 
 struct Command {
     sequence: u64,
-    key: u8,
+    control: Control,
     hold_ms: u64,
 }
 
@@ -19,15 +64,11 @@ impl Command {
     fn parse(line: &str) -> Option<Self> {
         let mut words = line.split_ascii_whitespace();
         let sequence = words.next()?.parse().ok()?;
-        let [key @ (b'W' | b'A' | b'S' | b'D' | b'I' | b'J' | b'K' | b'L')] =
-            *words.next()?.as_bytes()
-        else {
-            return None;
-        };
+        let control = Control::parse(words.next()?)?;
         let hold_ms = words.next()?.parse().ok()?;
         (words.next().is_none() && (1..=10_000).contains(&hold_ms)).then_some(Command {
             sequence,
-            key,
+            control,
             hold_ms,
         })
     }
@@ -48,7 +89,15 @@ impl PartialEq for HeldMovement {
 
 impl HeldMovement {
     pub(super) fn apply(&self, mut pad: PadState) -> Option<PadState> {
-        let (axis, value) = match self.command.key {
+        let key = match self.command.control {
+            Control::Stick(key) => key,
+            Control::Button(_, bit) if pad.buttons & bit == 0 => {
+                pad.buttons |= bit;
+                return Some(pad);
+            }
+            Control::Button(..) => return None,
+        };
+        let (axis, value) = match key {
             b'W' => (&mut pad.left_y, 1.0),
             b'S' => (&mut pad.left_y, -1.0),
             b'A' => (&mut pad.left_x, -1.0),
@@ -69,9 +118,9 @@ impl HeldMovement {
 
     pub(super) fn confirm_read(&self, state: &PadState) {
         if !self.read.load(Ordering::Relaxed) && !self.read.swap(true, Ordering::Relaxed) {
-            tracing::info!(sequence = self.command.sequence, key = %char::from(self.command.key),
+            tracing::info!(sequence = self.command.sequence, control = %self.command.control.label(), buttons = state.buttons,
                 left_x = state.left_x, left_y = state.left_y, right_x = state.right_x,
-                right_y = state.right_y, "GetGamepadState returned movement");
+                right_y = state.right_y, "GetGamepadState returned scripted input");
         }
     }
 }
@@ -112,8 +161,8 @@ impl MovementFile {
                 self.end();
                 if available {
                     let until = now + Duration::from_millis(command.hold_ms);
-                    tracing::info!(sequence = command.sequence, key = %char::from(command.key),
-                        hold_ms = command.hold_ms, "stand-in movement started");
+                    tracing::info!(sequence = command.sequence, control = %command.control.label(),
+                        hold_ms = command.hold_ms, "stand-in gamepad input started");
                     self.active = Some(Arc::new(HeldMovement {
                         command,
                         until,
@@ -127,8 +176,8 @@ impl MovementFile {
 
     fn end(&mut self) {
         if let Some(cue) = self.active.take() {
-            tracing::info!(sequence = cue.command.sequence, key = %char::from(cue.command.key),
-                "stand-in movement ended");
+            tracing::info!(sequence = cue.command.sequence, control = %cue.command.control.label(),
+                "stand-in gamepad input ended");
         }
     }
 }
@@ -167,6 +216,21 @@ mod tests {
     }
 
     #[test]
+    fn named_buttons_press_only_the_matching_xbox_button() {
+        for (name, bit) in BUTTONS {
+            let command = Command::parse(&format!("1 {name} 750")).unwrap();
+            let cue = HeldMovement {
+                command,
+                until: Instant::now(),
+                read: false.into(),
+            };
+            let state = cue.apply(PadState::default()).unwrap();
+            assert_eq!(state.buttons, bit);
+            assert!(cue.apply(state).is_none());
+        }
+    }
+
+    #[test]
     fn duplicate_and_old_sequences_do_not_extend_or_restart_movement() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("command");
@@ -197,7 +261,7 @@ mod tests {
         use super::super::{READING, Reading, Value, gamepad_state};
 
         let cue = Arc::new(HeldMovement {
-            command: Command::parse("17 L 3000").unwrap(),
+            command: Command::parse("17 PadA 3000").unwrap(),
             until: Instant::now() + Duration::from_secs(3),
             read: false.into(),
         });
@@ -217,7 +281,7 @@ mod tests {
         assert!(!gamepad_state(&reading, std::ptr::null_mut()));
         assert!(!cue.read.load(Ordering::Relaxed));
         assert!(gamepad_state(&reading, &mut pad));
-        assert_eq!(pad.right_x, 1.0);
+        assert_eq!(pad.buttons, A);
         assert!(cue.read.load(Ordering::Relaxed));
     }
 }

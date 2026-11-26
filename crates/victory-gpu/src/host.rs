@@ -107,15 +107,19 @@ pub(crate) fn long_ago(moment: u64, ms: u64, frames: u64) -> bool {
     (now >> 32).saturating_sub(moment >> 32) >= frames && tenths * 100 >= ms
 }
 
-/// Available physical RAM on the host in bytes, from `GlobalMemoryStatusEx`.
-pub(crate) fn available_physical_ram() -> Option<u64> {
+/// Available physical RAM and commit headroom for this process, in bytes.
+pub(crate) fn system_memory() -> Option<(u64, u64)> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     // SAFETY: plain data the call fills in.
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
     // SAFETY: a sized structure.
     let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
-    ok.then_some(m.ullAvailPhys)
+    ok.then_some((m.ullAvailPhys, m.ullAvailPageFile))
+}
+
+pub(crate) fn ram_headroom() -> Option<u64> {
+    system_memory().map(|(physical, commit)| physical.min(commit))
 }
 
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
@@ -143,13 +147,13 @@ pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
 
 /// Effective idle timeout (in milliseconds) for system-RAM caches (staging
 /// buffers, loose shadows, and the mapped pipeline library), scaled down
-/// when free physical RAM is low. Never returns less than 2,000 ms.
-pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
+/// when either physical RAM or commit headroom is low. Never returns less than 2,000 ms.
+pub(crate) fn ram_idle_ms(headroom: Option<u64>) -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
     const NORMAL_MS: u64 = 10_000;
     const MODERATE_MS: u64 = 5_000;
     const HIGH_MS: u64 = 2_000;
-    let Some(avail) = avail_phys else {
+    let Some(avail) = headroom else {
         return NORMAL_MS;
     };
     if avail < 2 * GIB {

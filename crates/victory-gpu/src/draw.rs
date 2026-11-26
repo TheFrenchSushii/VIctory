@@ -1902,7 +1902,7 @@ impl State {
         host.set_texture_pressure(!room);
         if !room {
             HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
-            once!("textures picked by index: VRAM texture budget reached; new allocations wait");
+            once!("textures picked by index: texture memory budget reached; new allocations wait");
         }
         let mut refused = 0;
         // Slots whose texture's memory the runtime mapped, unmapped or
@@ -1999,7 +1999,7 @@ impl State {
                     host.set_texture_pressure(!room);
                     if !room {
                         HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
-                        once!("textures picked by index: VRAM texture budget reached during upload pass; new allocations wait");
+                        once!("textures picked by index: texture memory budget reached during upload pass; new allocations wait");
                     }
                 }
             }

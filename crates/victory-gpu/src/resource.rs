@@ -1371,7 +1371,7 @@ pub(crate) fn host_made<'a>(
 
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
-/// up to `FLOOR` bytes of them, beyond that while the card's memory in use
+/// up to `FLOOR` bytes of them if host commit is available, beyond that while the card's memory in use
 /// by this process is under nine tenths of the budget the system gives it
 /// ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB` sets a
 /// limit on those copies' bytes instead). Past the budget the system moves
@@ -1379,6 +1379,22 @@ pub(crate) fn host_made<'a>(
 #[cfg(windows)]
 pub(crate) fn room() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
+    // Keep commit headroom for mandatory allocations and uploads already in
+    // flight. The DXGI budget can still have room when commit is exhausted.
+    const COMMIT_RESERVE: u64 = 2 << 30;
+    if let Some((physical, commit)) = crate::host::system_memory()
+        && commit < COMMIT_RESERVE
+    {
+        static REPORTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        REPORTED.get_or_init(|| {
+            tracing::warn!(
+                available_commit_mib = commit >> 20,
+                available_physical_mib = physical >> 20,
+                "deferring new streamed texture copies under host commit pressure"
+            );
+        });
+        return false;
+    }
     const FLOOR: u64 = 2 << 30;
     const WITHOUT_BUDGET: u64 = 4 << 30;
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
@@ -1670,7 +1686,8 @@ pub(crate) fn let_go_idle() {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
     }
-    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()))
+        .min(crate::host::ram_idle_ms(crate::host::ram_headroom()));
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);

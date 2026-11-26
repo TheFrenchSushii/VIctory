@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    GetLastError, HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_FAILED, WAIT_OBJECT_0, WPARAM,
+};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -509,6 +511,35 @@ static ON_FAILURE: OnceLock<fn(&str) -> !> = OnceLock::new();
 /// Sets what a host GPU failure does (the runtime's crash report).
 pub fn on_failure(report: fn(&str) -> !) {
     let _ = ON_FAILURE.set(report);
+}
+
+fn wait_for_fence_event(event: HANDLE) -> Result<(), String> {
+    // SAFETY: the caller keeps the event alive until the wait returns.
+    match unsafe { WaitForSingleObject(event, INFINITE) } {
+        WAIT_OBJECT_0 => Ok(()),
+        WAIT_FAILED => {
+            // SAFETY: read the error from the wait on this thread immediately.
+            let error = unsafe { GetLastError() };
+            Err(format!("WaitForSingleObject failed with Win32 error {}", error.0))
+        }
+        status => Err(format!("unexpected Win32 wait result {:#x}", status.0)),
+    }
+}
+
+fn wait_for_host_fence(fence: &ID3D12Fence, target: u64, event: HANDLE) -> Result<(), String> {
+    // SAFETY: the caller owns the event for this wait, and the fence is live.
+    unsafe { fence.SetEventOnCompletion(target, event) }
+        .map_err(|e| format!("SetEventOnCompletion({target}) failed: {e}"))?;
+    wait_for_fence_event(event)?;
+    // SAFETY: a plain query of the fence just waited for.
+    let completed = unsafe { fence.GetCompletedValue() };
+    if completed == u64::MAX {
+        return Err(format!("host device removed while waiting for fence {target}"));
+    }
+    if completed < target {
+        return Err(format!("fence event woke at {completed} before target {target}"));
+    }
+    Ok(())
 }
 
 /// Ends the run on a host GPU failure: what failed, the removal reason and
@@ -3915,8 +3946,6 @@ impl Host {
                 self.queue.Signal(&fence, sent)?;
                 drop(order);
                 self.card_sent();
-                fence.SetEventOnCompletion(sent, event)?;
-                WaitForSingleObject(event, INFINITE);
                 Ok(after)
             })()
         };
@@ -3924,6 +3953,9 @@ impl Host {
             Ok(after) => after,
             Err(e) => fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e}, VICTORY_RELAY=1)")),
         };
+        if let Err(e) = wait_for_host_fence(&fence, sent, event) {
+            fail(format_args!("could not wait for the card's readback ({e}, VICTORY_RELAY=1)"));
+        }
         let us = waiting.elapsed().as_micros() as u64;
         RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
         {
@@ -4127,17 +4159,18 @@ impl Host {
                     *submitted += 1;
                     self.queue.Signal(&self.fence, *submitted)?;
                     self.card_sent();
-                    self.fence.SetEventOnCompletion(*submitted, self.event)?;
-                    let was_working = working(false);
-                    WaitForSingleObject(self.event, INFINITE);
-                    stood(waiting);
-                    working(was_working);
                     Ok(())
                 })()
             };
             if let Err(e) = ran {
                 fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e})"));
             }
+            let was_working = working(false);
+            if let Err(e) = wait_for_host_fence(&self.fence, *submitted, self.event) {
+                fail(format_args!("could not wait for the card's readback ({e})"));
+            }
+            stood(waiting);
+            working(was_working);
             {
                 use crate::shadow::CARD_STATS;
                 CARD_STATS[3].fetch_add(pieces.len() as u64, Ordering::Relaxed);
@@ -4371,19 +4404,15 @@ impl Host {
             if flights > 0 {
                 submitting(2, flights);
                 let waiting = std::time::Instant::now();
-                // SAFETY: the fence and event are ours, under the
-                // submission lock; `submitted` is the last value signalled.
-                unsafe {
-                    match self.fence.SetEventOnCompletion(*submitted, self.event) {
-                        Ok(()) => {
-                            working(false);
-                            WaitForSingleObject(self.event, INFINITE);
-                            stood(waiting);
-                            working(true);
-                        }
-                        Err(e) => tracing::warn!(error = %e, "submissions sent ahead not waited for"),
-                    }
-                }
+                // The fence and event are ours under the submission lock.
+                working(false);
+                let waited = wait_for_host_fence(&self.fence, *submitted, self.event);
+                stood(waiting);
+                working(true);
+                // SAFETY: a plain query.
+                let waited = waited.and_then(|()| {
+                    unsafe { self.device.GetDeviceRemovedReason() }.map_err(|e| e.to_string())
+                });
                 let gpu = waiting.elapsed();
                 LATE_STATS[12].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 LATE_WAITED[why.min(10)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -4392,8 +4421,7 @@ impl Host {
                 crate::copystat::card_waited(gpu.as_micros() as u64, || {
                     format!("{flights} submissions sent ahead, settled together")
                 });
-                // SAFETY: a plain query.
-                if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                if let Err(e) = waited {
                     let runs: Vec<&HostList> = items
                         .iter()
                         .filter_map(|i| match i {
@@ -4403,7 +4431,7 @@ impl Host {
                         .flat_map(|f| f.order.iter().map(|&i| f.lists[i].host()))
                         .collect();
                     fail(format_args!(
-                        "host GPU device removed after {flights} submissions sent ahead (VICTORY_LATE_WAIT=1) of {} lists{}{}",
+                        "could not settle {flights} submissions sent ahead (VICTORY_LATE_WAIT=1) of {} lists ({e}){}{}",
                         runs.len(),
                         self.removal_data(&runs),
                         last_notes(&runs)
@@ -4688,18 +4716,27 @@ impl Host {
             unsafe {
                 self.queue.ExecuteCommandLists(group);
                 self.card_sent();
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        working(false);
-                        WaitForSingleObject(self.event, INFINITE);
-                        stood(started);
-                        working(true);
-                    }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                let signalled = self.queue.Signal(&self.fence, *submitted);
+                if let Err(e) = signalled {
+                    fail(format_args!(
+                        "could not signal host submission fence {}: {e}{}{}",
+                        *submitted, self.removal_data(runs), last_notes(runs)
+                    ));
+                }
+                working(false);
+                if let Err(error) = wait_for_host_fence(&self.fence, *submitted, self.event) {
+                    fail(format_args!(
+                        "host submission fence {}: {error}{}{}",
+                        *submitted, self.removal_data(runs), last_notes(runs)
+                    ));
+                }
+                stood(started);
+                working(true);
+                if let Err(e) = self.device.GetDeviceRemovedReason() {
+                    fail(format_args!(
+                        "host GPU device removed after a submission of {} lists ({e}){}{}",
+                        runs.len(), self.removal_data(runs), last_notes(runs)
+                    ));
                 }
             }
             // With timing on each group is one of `runs` (and the compare
@@ -4750,15 +4787,6 @@ impl Host {
                 .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
                 .collect();
             tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, "slow host submission");
-        }
-        // SAFETY: a plain query.
-        if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
-            fail(format_args!(
-                "host GPU device removed after a submission of {} lists{}{}",
-                runs.len(),
-                self.removal_data(runs),
-                last_notes(runs)
-            ));
         }
         submitting(3, runs.len());
         // What shaders wrote goes back before the bottom-of-pipe writes,
@@ -7678,6 +7706,53 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+
+    #[test]
+    fn a_failed_host_fence_wait_cannot_report_completion() {
+        use super::wait_for_fence_event;
+        use windows::Win32::Foundation::{CloseHandle, ERROR_INVALID_HANDLE, HANDLE};
+        use windows::Win32::System::Threading::CreateEventW;
+
+        let error = wait_for_fence_event(HANDLE::default()).unwrap_err();
+        assert_eq!(
+            error,
+            format!("WaitForSingleObject failed with Win32 error {}", ERROR_INVALID_HANDLE.0)
+        );
+
+        // SAFETY: a signalled event this test owns until the wait returns.
+        let event = unsafe { CreateEventW(None, false, true, None) }.unwrap();
+        let waited = wait_for_fence_event(event);
+        // SAFETY: the wait has returned and this test is the sole owner.
+        unsafe { CloseHandle(event) }.unwrap();
+        assert_eq!(waited, Ok(()));
+    }
+
+    #[test]
+    fn an_event_wake_requires_the_target_fence_value() {
+        use super::{wait_for_host_fence, warp_adapter};
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::System::Threading::CreateEventW;
+
+        let adapter = warp_adapter().unwrap();
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: the adapter is live and the output is an empty COM slot.
+        unsafe { D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device) }.unwrap();
+        let device = device.unwrap();
+        // SAFETY: the fence and the already-signalled event are owned by this test.
+        let fence: ID3D12Fence = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
+        let event = unsafe { CreateEventW(None, false, true, None) }.unwrap();
+        let early = wait_for_host_fence(&fence, 8, event);
+        // SAFETY: complete the fence and consume its event before closing it.
+        unsafe { fence.Signal(8) }.unwrap();
+        super::wait_for_fence_event(event).unwrap();
+        let completed = wait_for_host_fence(&fence, 8, event);
+        unsafe { CloseHandle(event) }.unwrap();
+
+        assert_eq!(early, Err("fence event woke at 0 before target 8".into()));
+        assert_eq!(completed, Ok(()));
     }
 
     #[test]

@@ -3,7 +3,7 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, sushi]
 
 permissions:
   contents: read
@@ -42,3 +42,7 @@ jobs:
         env:
           VICTORY_TESTS_ALLOW_SOFTWARE_SKIP: "1"
         run: cargo test --workspace --locked
+      - name: Tests, diagnostics build
+        env:
+          VICTORY_TESTS_ALLOW_SOFTWARE_SKIP: "1"
+        run: cargo test --workspace --all-features --locked

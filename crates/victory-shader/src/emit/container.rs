@@ -435,23 +435,26 @@ mod tests {
         assert_eq!(recovered[0].name, "TEXCOORD");
         assert_eq!(recovered[1].name, "COLOR");
         // PSV records can be in a different order again.
-        let psv = psv(&Psv {
-            stage: 1,
-            flag: false,
-            inputs: &[],
-            outputs: &[outputs[2].clone(), outputs[1].clone(), outputs[0].clone()],
-            prims: &[],
-            mesh: None,
-            geometry: None,
-            bindings: &[],
-            threads: [0; 3],
-            wave_size: None,
-        });
-        recovered[1].interp = 2;
-        super::super::vertex_output_interpolation(&psv, &mut recovered).unwrap();
-        assert_eq!(recovered.iter().map(|e| e.interp).collect::<Vec<_>>(), [1, 1, 2]);
-        assert!(super::super::vertex_output_interpolation(&psv[..psv.len() - 1], &mut recovered)
-            .is_err());
+        for stage in [1, 13] {
+            let psv = psv(&Psv {
+                stage,
+                flag: false,
+                inputs: &[],
+                outputs: &[outputs[2].clone(), outputs[1].clone(), outputs[0].clone()],
+                prims: &[],
+                mesh: None,
+                geometry: None,
+                bindings: &[],
+                threads: [0; 3],
+                wave_size: None,
+            });
+            recovered[1].interp = 2;
+            super::super::signature_interpolation(&psv, stage, false, &mut recovered).unwrap();
+            assert_eq!(recovered.iter().map(|e| e.interp).collect::<Vec<_>>(), [1, 1, 2]);
+            assert!(super::super::signature_interpolation(
+                &psv[..psv.len() - 1], stage, false, &mut recovered,
+            ).is_err());
+        }
     }
 
     #[test]

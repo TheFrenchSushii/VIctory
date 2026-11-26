@@ -34,7 +34,7 @@ use super::host::{GraphicsState, HostPipeline};
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
-    pub(crate) graphics: Option<Box<GraphicsState>>,
+    pub(crate) graphics: Option<Arc<GraphicsState>>,
     queue_state: AtomicU8,
     made: OnceLock<Option<HostPipeline>>,
     /// What identifies it across runs (shader containers and state), and
@@ -49,7 +49,18 @@ pub(crate) struct Pending {
 
 /// Why a pipeline with these shaders is not made, if it is not.
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
-    if without_structures(shaders) {
+    // HostPipeline::new cannot make a mesh pipeline on this device.
+    // Do not queue it, wait for it, or put it in the early-start list.
+    // Keep the host's final capability guard in place as well.
+    if shaders.iter().any(|s| s.stage == "mesh")
+        && crate::host::host().is_some_and(|host| !host.mesh_shaders())
+    {
+        static WARNED: OnceLock<()> = OnceLock::new();
+        WARNED.get_or_init(|| {
+            tracing::warn!("Mesh shader pipelines are unavailable on this host; skipping their compilation (geometry may be missing)");
+        });
+        Some("mesh pipeline unsupported by host (no mesh shader or SM 6.6)")
+    } else if without_structures(shaders) {
         Some("shades ray-tracing hits, left out")
     } else if too_dear(shaders) {
         Some("too dear to compile, left out")
@@ -103,7 +114,7 @@ unsafe impl Send for Pending {}
 unsafe impl Sync for Pending {}
 
 impl Pending {
-    pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
+    pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Arc<GraphicsState>>) -> Pending {
         let mut key = blake3::Hasher::new();
         for s in &shaders {
             key.update(s.stage.as_bytes());
@@ -703,6 +714,22 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_pipeline_never_enters_worker_queue_or_early_list() {
+        let mut p = Pending::new(Vec::new(), None);
+        p.left_out = Some("mesh pipeline unsupported by host (no mesh shader or SM 6.6)");
+        p.key = "unsupported-mesh-test".to_owned();
+        let p = Arc::new(p);
+        early(&p);
+        assert!(ready(&p).is_none());
+        assert!(!now(&p));
+        assert_eq!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+        assert!(p.made.get().is_none());
+        assert!(!super::super::library::wanted_early(&p.key));
+        #[cfg(feature = "diagnostics")]
+        assert_eq!(missing(&p).as_deref(), p.left_out);
+    }
+
+    #[test]
     fn pending_pipeline_is_recorded_for_the_next_launch() {
         let mut p = Pending::new(Vec::new(), None);
         p.key = "pending-pipeline-test".to_owned();
@@ -744,11 +771,11 @@ mod tests {
     fn early_depth_precedes_other_prewarming_and_requests_precede_both() {
         use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D32_FLOAT;
         let depth_pipeline = || {
-            let mut depth = Box::new(GraphicsState::default());
+            let mut depth = GraphicsState::default();
             let format = [16u32, DXGI_FORMAT_D32_FLOAT.0 as u32];
             // SAFETY: a complete depth-format subobject of the title pipeline stream.
             unsafe { depth.read(16, format.as_ptr().cast()) };
-            Arc::new(Pending::new(Vec::new(), Some(depth)))
+            Arc::new(Pending::new(Vec::new(), Some(Arc::new(depth))))
         };
         let normal = Arc::new(Pending::new(Vec::new(), None));
         let promoted = depth_pipeline();

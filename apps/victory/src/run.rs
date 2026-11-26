@@ -106,6 +106,9 @@ pub fn run(
         println!("not executing (pass --execute to start the title)");
         return Ok(());
     }
+    if let Err(error) = crate::xbox_pipelines::load(&title_dir.join("shaders.rpf")) {
+        tracing::warn!(%error, "Xbox pipeline catalog unavailable");
+    }
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
@@ -127,6 +130,7 @@ pub fn run(
     let code = main
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
+    anyhow::ensure!(code == 0, "Title exited with code {code:#010x}");
     println!("title exited with {code}");
     Ok(())
 }

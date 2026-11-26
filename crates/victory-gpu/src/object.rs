@@ -73,7 +73,6 @@ pub(crate) extern "system" fn add_ref(this: This) -> u32 {
 
 /// Pin a registry entry while its removal is excluded by the registry lock.
 /// A final release may already have reduced the count to zero before removal.
-#[cfg(windows)]
 pub(crate) fn try_add_ref(this: This) -> bool {
     // SAFETY: the caller holds the lock the object's destructor must acquire.
     unsafe { &*this }

@@ -11,7 +11,7 @@
 //! are ignored anyway).
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
@@ -119,6 +119,9 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
 struct Translate<F> {
     translate: F,
     ran: AtomicBool,
+    // Keep the translation until publication succeeds. A cache I/O
+    // failure must not turn an otherwise usable shader into a failed one.
+    result: Mutex<Option<Result<HostShader, String>>>,
 }
 
 impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<F> {
@@ -131,8 +134,10 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
-        Ok(encode(&shader))
+        let shader = (self.translate)(&input[32..]);
+        let encoded = shader.as_ref().map(encode).map_err(|e| anyhow::Error::msg(e.clone()));
+        *self.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(shader);
+        encoded
     }
 }
 
@@ -146,11 +151,22 @@ fn cached(
     let converter = Translate {
         translate,
         ran: AtomicBool::new(false),
+        result: Mutex::new(None),
     };
     for _ in 0..2 {
-        let path = cache
-            .get_or_convert(&converter, &input)
-            .map_err(|e| format!("{e:#}"))?;
+        let path = match cache.get_or_convert(&converter, &input) {
+            Ok(path) => path,
+            Err(error) => {
+                let result = converter.result.lock().unwrap_or_else(|e| e.into_inner()).take();
+                if matches!(&result, Some(Err(_))) {
+                    // The translator itself failed: preserve its error.
+                    return result.expect("translation result recorded");
+                }
+                tracing::warn!(error = %error, "shader cache unavailable; using in-memory translation");
+                MISSES.fetch_add(1, Ordering::Relaxed);
+                return result.unwrap_or_else(|| (converter.translate)(container));
+            }
+        };
         if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
             let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
                 (&MISSES, "translated and cached")
@@ -428,6 +444,31 @@ mod tests {
             }
         }
         files
+    }
+
+    #[test]
+    fn cache_publication_failure_keeps_the_successful_translation() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [7u8; 32];
+        let container = b"cache publication failure";
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        let converter = Translate {
+            translate,
+            ran: AtomicBool::new(false),
+            result: Mutex::new(None),
+        };
+        let input = [&build[..], &container[..]].concat();
+        let path = cache.path_for(&victory_pipeline::CacheKey::new(&converter, &input));
+        std::fs::create_dir_all(&path).unwrap();
+
+        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        assert!(path.is_dir());
     }
 
     #[test]

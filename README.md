@@ -1,32 +1,69 @@
-# DexNom Runtime
+# Sushi
 
-DexNom Runtime is a community fork of Marvisak's VIctory for Windows x64. It runs an Xbox Series executable from your own game installation and translates its GPU work for Direct3D 12. It builds on the Radeon runtime tested at `e061c69032b84ec6e2ec17340469cd689500dafd` and adds fixes for static sampler selection, wave64 lane masks and integer render targets. Game files, executables, saves and generated shader caches stay on your own computer.
+Sushi is a community fork of DexNom's VIctory runtime, based on Marvisak's VIctory for Windows x64. It runs an Xbox Series executable from your own game installation and translates its GPU work for Direct3D 12. It builds on the Radeon runtime tested at `e061c69032b84ec6e2ec17340469cd689500dafd` and adds fixes for static sampler selection, wave64 lane masks and integer render targets. Game files, executables, saves and generated shader caches stay on your own computer.
 
 ## Run it on your PC
 
 1. Use 64-bit Windows and a current Direct3D 12 driver. The game uses mesh shaders and Shader Model 6.6. The Radeon gameplay results and known issues are listed below.
 2. Install Rust for Windows and Visual Studio Build Tools. In the Visual Studio installer, select **Desktop development with C++**, including the x64 MSVC toolset and a Windows 10 or 11 SDK. [Rust installer](https://rustup.rs/) · [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
-3. Download this repository using **Code → Download ZIP**, extract the ZIP to a writable folder, and double-click **Setup.cmd**. Select the Series X game executable inside your own extracted game installation. Keep its accompanying files together. Setup downloads the pinned build dependencies, verifies the BCPack format tables, and compiles the three Windows programs locally. [Download source ZIP](https://github.com/DexNom/VIctory/archive/refs/heads/main.zip)
-4. Open **DexNom Runtime** from the Windows Start menu. Use a controller for the game's first-time setup. The launcher and your local data are in `%LOCALAPPDATA%\DexNom Runtime`. Saves are in `state`, shader caches in `cache`, and per-run diagnostics in `logs`. The file `logs\latest.txt` points to the latest game log.
+3. Download this repository using **Code → Download ZIP**, extract the ZIP to a writable folder, and double-click **Setup.cmd**. Select the Series X game executable inside your own extracted game installation. Keep its accompanying files together. Setup downloads the pinned build dependencies, verifies the BCPack format tables, and compiles the three Windows programs locally. [Download source ZIP](https://github.com/TheFrenchSushii/VIctory/archive/refs/heads/sushi.zip)
+4. Open **Sushi** from the Windows Start menu. Use a controller for the game's first-time setup. The launcher and your local data are in `%LOCALAPPDATA%\Sushi`. Saves are in `state`, shader caches in `cache`, and per-run diagnostics in `logs`. The file `logs\latest.txt` points to the latest game log.
 
-To update, close the runtime, extract the new source ZIP, and run **Setup.cmd** again. It reuses the saved game path and the same save directory. To select a different installation, pass its executable path to Setup from PowerShell:
+To update, close the runtime, extract the new source ZIP, and run **Setup.cmd** again. If updating an older custom installation, move the old installation directory to `%LOCALAPPDATA%\Sushi` first (only if the destination does not already exist), preserving `state`, `cache`, `logs` and `game-path.txt`. It reuses the saved game path and the same save directory. To select a different installation, pass its executable path to Setup from PowerShell:
 
 ```powershell
 .\Setup.cmd -GamePath "D:\My Games\Series X\game_scarlett_master.exe"
 ```
 
-To warm the shader cache, open `victory-warm.exe` in the installed runtime directory. The log lists translated and refused shaders. Graphics pipelines also depend on draw state encountered during play. If you see a missing `VCRUNTIME140.dll` error, install Microsoft's x64 redistributable. [Microsoft Visual C++ Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)
+To prepare the shader cache and then automatically start the game, open **Sushi (Compile shaders and play)** from the Start menu, or run `victory-warm.exe` from the installed runtime directory. The launcher checks the saved game executable, essential GTA VI archives, and separate cache, save and log directories before preloading. It displays the current phase, actual per-file candidate progress and running totals in the console. After a successful compiler exit and nonempty final summary, it starts the game automatically under the same session lock. On subsequent launches, the warmer first checks its local `cache/warmup-complete-v2.txt` marker against the installed runtime binary, game file inventory (names, sizes and modification times), runtime environment settings and previously recorded shader cache entries. If these checks pass, it prints the previous totals, including refusals, and starts the game using the cached translations. New entries added during gameplay are allowed. Old caches without a marker need one successful warmup to establish this record, reusing compatible translations. No existing cache entries are deleted by this check. The marker is not a full content checksum of every archive or cache entry, and the runtime/driver still validates individual shader and pipeline data at use time. If preloading fails, it does not start the game. Unsupported shaders may still be reported even after a successful preload; this is not a guarantee of correct rendering.
+
+Optional launcher modes, from PowerShell in the installation directory:
+
+```powershell
+.\victory-warm.exe --check-paths  # validate paths without compiling or playing
+.\victory-warm.exe --warm-only    # verify or warm the cache without starting the game
+.\victory-warm.exe --force-warm   # force a full warmup pass, then play (reuse compatible cache entries)
+.\victory-play.exe               # start the game directly using the existing cache
+```
+
+If the saved game path is incorrect, run Setup.cmd again with the correct `-GamePath`. The warmup and game retain separate logs (`logs\latest-warm.txt` and `logs\latest.txt`). Graphics pipelines also depend on draw state encountered during play. If you see a missing `VCRUNTIME140.dll` error, install Microsoft's x64 redistributable. [Microsoft Visual C++ Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)
 
 For a manual build, run `.\Initialize-FormatTables.ps1`, then `cargo build --locked --release -p victory --features diagnostics --bins`. The release binaries are in `target\release`. Place all three together outside the checkout and pass the game executable path to `victory-play.exe`. Custom data and cache directories are documented in the configuration example. [Configuration example](victory.example.toml)
 
+## Experimental performance profile
+
+Run the installed launcher from PowerShell to test a lower reported display mode and parallel CPU preparation, without deleting the cache:
+
+```powershell
+& "$env:LOCALAPPDATA\Sushi\victory-play.exe" --performance
+```
+
+The profile sets `VICTORY_DISPLAY_MODE=1280x720`, `VICTORY_FILL_WORKERS=4` and `VICTORY_PARALLEL_PRELUDES=1` unless explicitly overridden in the environment. These are existing runtime options, not a forced internal rendering resolution; the title may ignore the display mode. Compare the same scene with and without the profile. The default launcher remains unchanged. `victory-warm.exe --performance` also accepts the profile.
+
+Sushi now excludes unsupported mesh pipelines from the pipeline worker queue and early-start list when the host capability query rejects them. The final D3D12 capability guard is retained. This reduces pointless work but does **not** emulate mesh shaders or restore missing geometry on GPUs without mesh-shader support. The incomplete pipeline creation methods and other rejected host descriptors/pipelines require separate implementation and validation. No FPS improvement has been measured on a GTX 1080 Ti for these changes.
+
+## Graphics compatibility diagnostics
+
+Empty buffer descriptors are now rejected before allocating a backing buffer, and UAV rebasing checks for integer overflow. The texture uploader rechecks its video-memory budget in batches of 32 candidates, rather than relying on a single sample for an entire upload pass. These changes do not make an invalid descriptor valid or guarantee that more textures will fit.
+
+For a diagnostic run with the Windows Direct3D debug layer installed:
+
+```powershell
+$env:VICTORY_D3D12_DEBUG = '1'
+& "$env:LOCALAPPDATA\Sushi\victory-play.exe" --performance
+Remove-Item Env:VICTORY_D3D12_DEBUG -ErrorAction SilentlyContinue
+```
+
+Install the Windows optional **Graphics Tools** feature if the runtime reports that the debug layer is unavailable. Pipeline rejection logs now include shader identifiers and the relevant pipeline/root-signature context. Debug runs are not suitable for measuring FPS. Known unresolved issues include typed 12-byte SRVs whose shared backing is not aligned to an element, unimplemented console pipeline creation methods, and mesh shader emulation on GPUs without native support. Do not bypass the capability/descriptor checks to hide these errors.
+
 ## Try experimental ray tracing on Radeon
 
-After running **Setup.cmd**, open **DexNom Runtime (Experimental RT)** from the Windows Start menu. This starts the game with the acceleration-structure builder, ray traversal and lighting resolve enabled. The shortcut uses your existing saves. Open **DexNom Runtime** for the usual renderer.
+After running **Setup.cmd**, open **Sushi (Experimental RT)** from the Windows Start menu. This starts the game with the acceleration-structure builder, ray traversal and lighting resolve enabled. The shortcut uses your existing saves. Open **Sushi** for the usual renderer.
 
 To start the same RT configuration from PowerShell:
 
 ```powershell
-& "$env:LOCALAPPDATA\DexNom Runtime\victory-play.exe" --rt
+& "$env:LOCALAPPDATA\Sushi\victory-play.exe" --rt
 ```
 
 Chapter 1 City produced in-range ray and triangle intersections on an RX 7900 XTX. The game builds and traverses its acceleration structures through translated Direct3D 12 compute shaders. Frame times can still reach several seconds. Interior lighting, shadows and performance vary by scene. [Ray-tracing implementation](docs/fork-ray-tracing.md) · [City testing](BENCHMARK.md)
@@ -55,10 +92,12 @@ For a local experiment, open PowerShell and run the following after setup. The p
 ```powershell
 $env:VICTORY_FILL_WORKERS = '4'
 $env:VICTORY_PARALLEL_PRELUDES = '1'
-& "$env:LOCALAPPDATA\DexNom Runtime\victory-play.exe"
+& "$env:LOCALAPPDATA\Sushi\victory-play.exe"
 ```
 
 ## Credits and licensing
+
+- DexNom developed the upstream runtime used by Sushi. [DexNom/VIctory](https://github.com/DexNom/VIctory)
 
 - Marvisak and the VIctory contributors created the original runtime. [Marvisak/VIctory](https://github.com/Marvisak/VIctory)
 - ZSlayerHQ and the contributors to the victory-world line provided the rendering baseline used here, including the Radeon work from triippywhale and asdaasdsaddf. [victory-world-runtime](https://github.com/ZSlayerHQ/victory-world-runtime) · [Integrated revision](https://github.com/ZSlayerHQ/victory-world-runtime/commit/99f8834aa16b98d7f3943b8de262a8d4857bda7b)

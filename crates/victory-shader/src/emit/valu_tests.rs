@@ -450,14 +450,17 @@ fn permlane_alone_requires_the_console_wave_width() {
     // No readlane or LDS instruction to request the wave width on its behalf.
     for op in [0x377, 0x378] {
         let shader = build_cs(&vop3(op, 0, vgpr(0), sgpr(0), sgpr(1)), 32, 0);
-        let container = crate::Container::parse(&shader.dxil).unwrap();
-        let psv = container.part(crate::FourCC::PSV0).unwrap().data;
-        // PSVRuntimeInfo starts after the four-byte size. Its minimum and
-        // maximum lane counts must both equal the console wave width.
-        let min = u32::from_le_bytes(psv[20..24].try_into().unwrap());
-        let max = u32::from_le_bytes(psv[24..28].try_into().unwrap());
-        assert_eq!((min, max), (32, 32));
+        assert_eq!(declared_wave_range(&shader), (32, 32));
     }
+}
+
+fn declared_wave_range(shader: &HostShader) -> (u32, u32) {
+    let container = crate::Container::parse(&shader.dxil).unwrap();
+    let psv = container.part(crate::FourCC::PSV0).unwrap().data;
+    // PSVRuntimeInfo starts after the four-byte size.
+    let min = u32::from_le_bytes(psv[20..24].try_into().unwrap());
+    let max = u32::from_le_bytes(psv[24..28].try_into().unwrap());
+    (min, max)
 }
 
 #[test]
@@ -1234,6 +1237,38 @@ const DS_MIN_RTN_F32: u8 = 0x32;
 const DS_MAX_RTN_F32: u8 = 0x33;
 const DS_READ_B32: u8 = 0x36;
 
+#[test]
+fn straight_line_lds_transfers_between_warp_waves() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut words = vec![s_mov_b32(5, 0x80)];
+    words.extend(s_load_dwordx4(8, 4));
+    words.push(vop2(0x1a, 1, 0x82, 0)); // v_lshlrev_b32 v1, 2, v0
+    words.extend(ds(DS_WRITE_B32, 0, 1, 0)); // LDS[thread * 4] = thread
+    words.push(vop2(0x1d, 2, 0x90, 1)); // v_xor_b32 v2, 16, v1
+    words.extend(ds(DS_READ_B32, 3, 2, 0)); // v3 = LDS[(thread ^ 4) * 4]
+    words.extend([0xE070_1000, 0x8002_0301, S_ENDPGM]); // UAV[thread] = v3
+
+    let host = Host::new(true).expect("WARP is required to test cross-wave LDS");
+    let saved = lower::TEST_HOST_WAVE.replace(Some(4));
+    let shader = lower_words(words, 8, 512, 0);
+    lower::TEST_HOST_WAVE.set(saved);
+    assert_eq!(declared_wave_range(&shader), (0, u32::MAX));
+    let (root, pipeline) = host.compute_pipeline(&shader).expect("WARP compute pipeline");
+    let output = host
+        .dispatch(
+            &root,
+            &pipeline,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords() as usize]))],
+                views: &[View::RawUav(8)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("WARP compute dispatch");
+    assert_eq!(output[0], [4, 5, 6, 7, 0, 1, 2, 3]);
+}
+
 /// What RDNA2 writes for `ds_max_f32` / `ds_min_f32` over a dword holding
 /// `old` with `data` (bits), as measured on gfx1036 with f32 denormals kept:
 /// an sNaN, data first, then memory, is written quieted; otherwise a NaN
@@ -1312,10 +1347,8 @@ fn ds_min_max_f32_order_floats_and_return_the_old_value() {
         returns_new.extend(ds(plain, 0, 5, 2));
         returns_new.extend(ds(DS_READ_B32, 0, 5, 0));
         for (body, old_result) in [(returns_old, true), (returns_new, false)] {
-            // One thread with LDS declares WaveSize(32), which WARP's
-            // pipeline creation refuses: hardware only (the 64-thread test
-            // below runs on WARP too).
             let shader = build_cs(&body, 1, 512);
+            assert_eq!(declared_wave_range(&shader), (0, u32::MAX));
             run_cases_on(
                 &shader,
                 &cases,

@@ -93,6 +93,8 @@ mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+#[cfg(test)]
+mod ordered_pixel_tests;
 mod own_bits;
 mod rect;
 mod sampler;
@@ -659,10 +661,13 @@ fn emit_program(
             _ => 0,
         };
     }
-    if native.stage == HwStage::Vs
-        && let Some(psv) = c.part(FourCC::PSV0)
-    {
-        vertex_output_interpolation(psv.data, &mut outputs)?;
+    if let Some(psv) = c.part(FourCC::PSV0) {
+        match native.stage {
+            HwStage::Ps => signature_interpolation(psv.data, 0, true, &mut inputs)?,
+            HwStage::Vs => signature_interpolation(psv.data, 1, false, &mut outputs)?,
+            HwStage::Ms => signature_interpolation(psv.data, 13, false, &mut outputs)?,
+            _ => {}
+        }
     }
     // With a conservative depth output (SV_DepthLessEqual, GreaterEqual) DXIL
     // wants the position centroid (or per sample), as DXC declares it then.
@@ -743,15 +748,17 @@ fn emit_program(
     Ok((shader, wave_size))
 }
 
-/// The title's vertex output interpolation lives in PSV0. A float packed
-/// beside an integer can be explicitly constant, as can a float on its own.
-/// OSG1 supplies the physical rows and columns used to match both tables.
-fn vertex_output_interpolation(
+/// PSV0 records which elements are explicitly flat, including floats
+/// packed beside an integer or a system value. ISG1/OSG1 supply the
+/// physical rows and columns used to match the two tables.
+fn signature_interpolation(
     mut data: &[u8],
-    outputs: &mut [container::SigElement],
+    stage: u8,
+    input: bool,
+    signature: &mut [container::SigElement],
 ) -> Result<(), ShaderError> {
     const TRUNCATED: ShaderError =
-        ShaderError::Malformed("truncated vertex pipeline validation data");
+        ShaderError::Malformed("truncated shader pipeline validation data");
     fn take<'a>(data: &mut &'a [u8], len: usize) -> Result<&'a [u8], ShaderError> {
         let (head, tail) = data.split_at_checked(len).ok_or(TRUNCATED)?;
         *data = tail;
@@ -764,7 +771,12 @@ fn vertex_output_interpolation(
     let info = take(&mut data, info_size)?;
     // PSVRuntimeInfo0 has no signature. PSVRuntimeInfo1 and later share
     // these stage and signature count fields.
-    if info.len() < 36 || info[24] != 1 || info[29] == 0 {
+    if info.len() < 36 || info[24] != stage {
+        return Ok(());
+    }
+    let (inputs, outputs) = (usize::from(info[28]), usize::from(info[29]));
+    let (skip, count) = if input { (0, inputs) } else { (inputs, outputs) };
+    if count == 0 {
         return Ok(());
     }
     let resources = size(&mut data)?;
@@ -780,25 +792,25 @@ fn vertex_output_interpolation(
     if stride < 16 {
         return Err(TRUNCATED);
     }
-    let count = usize::from(info[28]) + usize::from(info[29]);
+    take(&mut data, skip.checked_mul(stride).ok_or(TRUNCATED)?)?;
     let elements = take(&mut data, count.checked_mul(stride).ok_or(TRUNCATED)?)?;
-    for record in elements.chunks_exact(stride).skip(usize::from(info[28])) {
+    for record in elements.chunks_exact(stride) {
         let packed = record[10];
         if packed & 0x40 == 0 {
             continue;
         }
         if record[13] > 7 {
-            return Err(ShaderError::Malformed("invalid vertex output interpolation"));
+            return Err(ShaderError::Malformed("invalid signature interpolation"));
         }
         let first = u32::from(record[9]);
         let rows = first..first + u32::from(record[8]);
-        for output in outputs.iter_mut().filter(|e| {
+        for element in signature.iter_mut().filter(|e| {
             e.row.is_some_and(|r| rows.contains(&r))
                 && e.col == ((packed >> 4) & 3)
                 && e.cols == (packed & 15)
                 && e.kind == record[11]
         }) {
-            output.interp = record[13];
+            element.interp = record[13];
         }
     }
     Ok(())
@@ -1842,6 +1854,15 @@ mod barycentric_tests {
         input_addr: u32,
         inputs: &[SigElement],
     ) -> Result<HostShader, ShaderError> {
+        pixel_from_signatures(words, input_addr, inputs, None)
+    }
+
+    fn pixel_from_signatures(
+        words: &[u32],
+        input_addr: u32,
+        inputs: &[SigElement],
+        psv: Option<&[u8]>,
+    ) -> Result<HostShader, ShaderError> {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
@@ -1869,7 +1890,11 @@ mod barycentric_tests {
         target.usage = 15;
         let isg1 = container::signature(inputs, true);
         let osg1 = container::signature(&[target], false);
-        let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+        let mut parts = vec![(FourCC::ISG1, isg1.as_slice()), (FourCC::OSG1, osg1.as_slice())];
+        if let Some(psv) = psv {
+            parts.push((FourCC::PSV0, psv));
+        }
+        let bytes = crate::dxbc::build(&parts);
         let c = Container::parse(&bytes).unwrap();
         let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
         let res = resource::track(&p, &native.layout, native.stage, None)?;
@@ -1896,6 +1921,27 @@ mod barycentric_tests {
             v.validate(&mut shader.dxil.clone()).unwrap();
         }
         let _ = shader;
+    }
+
+    #[test]
+    fn reflected_flat_float_stays_flat_when_read_beside_front_face() {
+        let inputs = [
+            SigElement { interp: 1, cols: 1, ..element("TEXCOORD", 0, 0) },
+            SigElement { interp: 1, comp: 5, col: 1, cols: 1, ..element("SV_IsFrontFace", 13, 0) },
+        ];
+        let psv = container::psv(&container::Psv {
+            stage: 0, flag: false, inputs: &inputs, outputs: &[], prims: &[],
+            mesh: None, geometry: None, bindings: &[], threads: [0; 3], wave_size: None,
+        });
+        let [e0, e1] = exp_mrt0(2);
+        let shader = pixel_from_signatures(
+            &[0xc808_0000, 0xc809_0001, e0, e1, S_ENDPGM], PERSP_CENTER, &inputs, Some(&psv),
+        ).unwrap();
+        let mut emitted = parts(&shader).1;
+        let module = Container::parse(&shader.dxil).unwrap();
+        signature_interpolation(module.part(FourCC::PSV0).unwrap().data, 0, true, &mut emitted).unwrap();
+        assert_eq!(emitted.iter().map(|e| e.interp).collect::<Vec<_>>(), [1, 1]);
+        validate(&shader);
     }
 
     #[test]

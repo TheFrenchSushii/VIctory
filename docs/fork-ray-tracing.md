@@ -1,4 +1,4 @@
-# Ray tracing in DexNom Runtime
+# Ray tracing in Sushi
 
 The experimental ray-tracing path runs in Chapter 1 City on a Radeon RX 7900 XTX.
 A GPU counter on one of the game's traversal shaders recorded finite triangle

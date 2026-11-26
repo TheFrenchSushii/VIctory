@@ -70,6 +70,8 @@ translation_inputs! {
     "emit/shader.rs",
     "emit/threading.rs",
     "emit/typed_views.rs",
+    "emit/group_lds.rs",
+    "emit/ordered_pixel.rs",
     "emit/validator.rs",
     "emit/wave.rs",
     "gfx10/fields.rs",
@@ -90,13 +92,14 @@ mod source_tests {
     use std::path::{Path, PathBuf};
 
     // host.rs consumes finished DXIL to create or run host pipelines. The
-    // remaining modules are only compiled by the Windows execution tests.
+    // remaining modules are only compiled by tests.
     const OUTSIDE_TRANSLATION: &[&str] = &[
         "emit/cube_lod_tests.rs",
         "emit/diff_tests.rs",
         "emit/helper_lane_tests.rs",
         "emit/host.rs",
         "emit/intersect_tests.rs",
+        "emit/ordered_pixel_tests.rs",
         "emit/valu_tests.rs",
         "emit/waterfall_tests.rs",
         "emit/wave64_tests.rs",

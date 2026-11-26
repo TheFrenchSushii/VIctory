@@ -36,7 +36,8 @@ const HEADER: usize = 0x80;
 const GRAPHICS: usize = 0x70;
 const COMPUTE: usize = 0x18;
 const NONE: u32 = u32::MAX;
-/// Hardware stages of a graphics entry, in its slot order.
+/// Hardware stages of a graphics entry, in its slot order. Native mesh
+/// programs use the geometry slot.
 pub const STAGES: [&str; 7] = ["PS", "VS", "GS", "ES", "HS", "LS", "fetch"];
 
 fn u32_at(b: &[u8], o: usize) -> Option<u32> {

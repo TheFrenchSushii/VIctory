@@ -2244,6 +2244,11 @@ impl HostHeap {
         if !buffer {
             return true;
         }
+        // Empty and malformed views have no backing to maintain; do not
+        // allocate a shadow merely to check whether their null slot is current.
+        if buffer_range(view).is_none() {
+            return true;
+        }
         let Some((address, width)) = buffer_extent(view) else { return true };
         let Some(shadow) = crate::shadow::find(address, width) else { return false };
         if let Some(current) = self.shows(index, &shadow.buffer) {
@@ -2444,13 +2449,13 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
         _ => return None,
     };
     let desc = srv_desc(words);
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER {
+        return None;
+    }
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { desc.Anonymous.Buffer };
-    Some((
-        base.checked_add(buffer.FirstElement.checked_mul(element)?)?,
-        u64::from(buffer.NumElements) * element,
-    ))
+    checked_buffer_range(base, buffer.FirstElement, buffer.NumElements, element)
 }
 
 /// The title memory the host slot of buffer view `view` is made on
@@ -2510,6 +2515,9 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
 /// [`buffer_range`] of an unordered access view of memory at `base`.
 fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     let desc = uav_desc(words);
+    if desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
+        return None;
+    }
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { desc.Anonymous.Buffer };
     let element = if buffer.StructureByteStride > 0 {
@@ -2519,10 +2527,20 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     } else {
         crate::resource::element(desc.Format.0 as u32)?.0
     };
-    Some((
-        base.checked_add(buffer.FirstElement.checked_mul(element)?)?,
-        u64::from(buffer.NumElements) * element,
-    ))
+    checked_buffer_range(base, buffer.FirstElement, buffer.NumElements, element)
+}
+
+/// Do not schedule transfers for an empty, unknown-size, or overflowing
+/// descriptor. In particular, the end must be representable: consumers
+/// of this range form an exclusive end when merging GPU writebacks.
+fn checked_buffer_range(base: u64, first: u64, count: u32, element: u64) -> Option<(u64, u64)> {
+    if count == 0 || element == 0 {
+        return None;
+    }
+    let start = base.checked_add(first.checked_mul(element)?)?;
+    let len = u64::from(count).checked_mul(element)?;
+    start.checked_add(len)?;
+    Some((start, len))
 }
 
 /// The host resource a slot made by [`make`] views, if any.
@@ -2539,7 +2557,7 @@ type Kept = Option<ID3D12Resource>;
 /// the bytes must start on 16 (the host's raw view alignment) and be whole
 /// dwords. A view that cannot stays structured.
 fn raw_window(offset: u64, first: u64, count: u32, stride: u32) -> Option<(u64, u32)> {
-    if stride == 0 {
+    if stride == 0 || count == 0 {
         return None;
     }
     let start = first.checked_mul(u64::from(stride))?.checked_add(offset)?;
@@ -2678,6 +2696,15 @@ fn buffer_srv(
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
+    // Reject empty/non-buffer descriptors before looking up or allocating
+    // a host copy. The caller installs its null descriptor on failure.
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER {
+        return None;
+    }
+    // SAFETY: the dimension above selects this union member.
+    if unsafe { desc.Anonymous.Buffer.NumElements } == 0 {
+        return None;
+    }
     let shadow = crate::shadow::find(address, len)?;
     let offset = shadow.offset(address);
     // SAFETY: a live buffer.
@@ -2748,6 +2775,13 @@ fn buffer_uav(
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
+    if desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
+        return None;
+    }
+    // SAFETY: the dimension above selects this union member.
+    if unsafe { desc.Anonymous.Buffer.NumElements } == 0 {
+        return None;
+    }
     let shadow = crate::shadow::find(address, len)?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
@@ -2779,7 +2813,7 @@ fn buffer_uav(
             left_null("not on an element of their host copy", true, address, len, element, buffer.FirstElement);
             return None;
         }
-        buffer.FirstElement += offset / element;
+        buffer.FirstElement = buffer.FirstElement.checked_add(offset / element)?;
     }
     buffer.CounterOffsetInBytes = 0;
     // SAFETY: a live buffer.
@@ -2955,6 +2989,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
+            if size == 0 {
+                return None;
+            }
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
@@ -3682,6 +3719,8 @@ mod tests {
         // past the buffer, not on 16 bytes, no elements
         assert!(!buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, first, count, 0, true, 2000));
         assert!(raw_window(4, 0, 100, 20).is_none());
+        assert!(raw_window(0, 0, 0, 16).is_none());
+        assert!(raw_window(0, u64::MAX, 1, 16).is_none());
         assert!(!buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, 0, 0, 0, true, 4096));
         // a structured view the host takes as it is
         assert!(buffer_view_ok(DXGI_FORMAT_UNKNOWN, 1, 10, 12, false, 4096));
@@ -3694,6 +3733,16 @@ mod tests {
         assert_eq!(constant_size(65_536), 65_536);
         assert_eq!(constant_size(969_472), 65_536);
         assert_eq!(constant_size(u32::MAX), 65_536);
+    }
+
+    #[test]
+    fn invalid_buffer_ranges_do_not_schedule_memory_transfers() {
+        assert_eq!(checked_buffer_range(0x1000, 2, 42, 12), Some((0x1018, 504)));
+        assert_eq!(checked_buffer_range(0x1000, 2, 0, 12), None);
+        assert_eq!(checked_buffer_range(0x1000, 2, 42, 0), None);
+        assert_eq!(checked_buffer_range(0, u64::MAX, 2, 4), None);
+        assert_eq!(checked_buffer_range(u64::MAX - 3, 0, 1, 4), None);
+        assert_eq!(checked_buffer_range(0, 0, u32::MAX, u64::MAX), None);
     }
 
     #[test]

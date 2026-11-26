@@ -27,6 +27,10 @@ pub(super) mod intersect;
 
 #[path = "guest_address.rs"]
 mod guest_address;
+#[path = "group_lds.rs"]
+mod group_lds;
+#[path = "ordered_pixel.rs"]
+mod ordered_pixel;
 #[path = "packed_mask.rs"]
 mod packed_mask;
 #[path = "typed_views.rs"]
@@ -262,7 +266,9 @@ struct Lower<'a> {
     /// loop a lane can be cut out of): the barrier there keeps its fences
     /// and does not wait for the group ([`super::group_sync`]).
     fence_only: HashSet<usize>,
-    /// A group barrier before every LDS access (a console wave run as two host waves).
+    portable_lds: bool,
+    ordered_pixel: Option<ordered_pixel::OrderedPixel>,
+    /// A group barrier before each LDS access when a console wave spans host waves.
     split_lds: bool,
     /// With `split_lds`, LDS accesses in lane branches: per IR block whether every lane runs
     /// it, and whether the host waves meet at its start and before its exit ([`lds_meetings`]).
@@ -1275,7 +1281,7 @@ impl<'a> Lower<'a> {
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
         let mut console_lanes = false;
-        // LDS accesses get a group barrier each (a console wave split in two host waves)
+        let mut portable_lds = false;
         let mut split_lds = false;
         // with `split_lds`, LDS accesses in lane branches: the blocks every lane runs, and
         // where the host waves meet around those branches (`lds_meetings`)
@@ -1326,16 +1332,7 @@ impl<'a> Lower<'a> {
                 if !crosses && (s.lds_dwords == 0 || group <= 32) {
                     wave = 32;
                 } else {
-                    // (Groups of several console waves too: each console wave is two host
-                    // waves, which exchange through their own pair of dwords.)
-                    // LDS the console shares within its one wave without barriers: split into
-                    // two waves of 32, a group barrier before every LDS access keeps their order
-                    // – where every thread of the group gets there (no lane branch around it,
-                    // no guard), else a barrier would hang the group
-                    let lds = |i: &Inst| {
-                        matches!(i.fields, Fields::Ds { .. })
-                            && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
-                    };
+                    let lds = group_lds::access;
                     if let Some(all) = all_lane_blocks(x.st) {
                         let ok = p.blocks.iter().enumerate().all(|(b, blk)| {
                             blk.insts.iter().all(|inst| {
@@ -1415,6 +1412,8 @@ impl<'a> Lower<'a> {
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
             }
+            portable_lds = !console_lanes && one_wave && s.lds_dwords > 0
+                && group_lds::portable(group, wave, x.st);
         }
         // The title's barriers a thread of the group may never reach, which
         // leaves the others waiting on the host: those in blocks some lanes
@@ -1553,6 +1552,9 @@ impl<'a> Lower<'a> {
             writes_uavs,
             src0: None,
             console_lanes,
+            portable_lds,
+            ordered_pixel: (x.native.stage == HwStage::Ps && !partial)
+                .then(|| ordered_pixel::OrderedPixel::recognize(p)).flatten(),
             split_lds,
             lds_meet,
             local: exchange.is_some() && LOCAL_WAVES.get(),
@@ -2280,6 +2282,9 @@ impl<'a> Lower<'a> {
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
+        if self.portable_lds && self.s.flags & flags::WAVE_OPS == 0 {
+            self.s.wave_size = None;
+        }
         let wave_size = self.s.wave_size;
         Ok(Lowered {
             wave_size,
@@ -2321,6 +2326,9 @@ impl<'a> Lower<'a> {
                 }
                 Reg::S(n) => match io_inputs.get(&v) {
                     Some(&input) => self.input(input),
+                    None if self.ordered_pixel.as_ref().is_some_and(|r| r.overlap == v) => {
+                        Val::I32(self.s.m.i32(0))
+                    }
                     // Above the SGPRs the hardware initializes, a register
                     // holds what the last wave left, so no program depends
                     // on it: a read the paths only seem to allow (a branch
@@ -3244,6 +3252,8 @@ impl<'a> Lower<'a> {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
                 self.i32_of(v)
             }
+            Operand::Const(ordered_pixel::EXITING_WAVE)
+                if self.ordered_pixel.as_ref().is_some_and(|r| r.polls.contains(&inst.machine.offset)) => Ok(self.s.m.i32(0)),
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
@@ -4848,7 +4858,8 @@ impl<'a> Lower<'a> {
             // each host wave answers for itself.
             MaskData::None => self.uniform_test(inst),
         };
-        let effect = matches!(inst.fields, Fields::Exp { .. })
+        let effect = self.ordered_image((b, i))
+            || matches!(inst.fields, Fields::Exp { .. })
             || matches!(inst.fields, Fields::Flat { .. }) && !name.starts_with("global_load_")
             || name.contains("store")
             || name.contains("atomic")
@@ -4857,17 +4868,7 @@ impl<'a> Lower<'a> {
                 && !(name.starts_with("ds_read")
                     || name.starts_with("ds_swizzle")
                     || name.contains("permute"));
-        if self.split_lds
-            && matches!(inst.fields, Fields::Ds { .. })
-            && !(name.starts_with("ds_swizzle") || name.contains("permute"))
-            && self.lds_meet.as_ref().is_none_or(|(all, _)| all[b])
-        {
-            // the two host waves of a console wave meet before each LDS access: what the other
-            // half wrote is visible, and what it still reads is not overwritten
-            let mode = self.s.m.i32(meeting_mode());
-            let void = self.s.t.void;
-            self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
-        }
+        self.sync_lds(inst, b);
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
@@ -9268,9 +9269,7 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Whether the program reads attribute row `row` per vertex (an
-    /// interpolation with computed barycentrics, or P10 or P20): then its
-    /// element is declared constant and read with `attributeAtVertex`.
+    /// Computed weights and P10/P20 use constant inputs and `attributeAtVertex`.
     fn per_vertex(&self, row: u8) -> bool {
         self.x.io.interps.iter().any(|(_, i)| match *i {
             Interp::Weighted { attribute } => attribute.row == row,
@@ -9281,8 +9280,7 @@ impl<'a> Lower<'a> {
         })
     }
 
-    /// Whether the program interpolates attribute row `row` (so the
-    /// hardware holds P1 - P0 and P2 - P0 for it).
+    /// Interpolated rows carry the console's P1 - P0 and P2 - P0 deltas.
     fn interpolated(&self, row: u8) -> bool {
         self.x.io.interps.iter().any(|(_, i)| match *i {
             Interp::Interpolated { attribute, .. } | Interp::Weighted { attribute } => {
@@ -9292,11 +9290,21 @@ impl<'a> Lower<'a> {
         })
     }
 
-    /// Channel `ch` of input row `row` evaluated as `eval` says, as raw bits.
+    /// Returns the raw bits of the evaluated input channel.
     fn eval_channel(&mut self, row: u8, ch: u8, eval: Eval) -> Result<V, Why> {
         let (id, col) = self
             .find_input(row, ch)
             .ok_or("an input the signature lacks")?;
+        let eval = if self.x.inputs.get(id).is_some_and(|e| e.interp == 1) {
+            // A flat input has zero interpolation deltas. The console can
+            // still read it through an interpolation instruction.
+            match eval {
+                Eval::Weights { p0: false, .. } => return Ok(self.s.m.i32(0)),
+                _ => Eval::Mode(1),
+            }
+        } else {
+            eval
+        };
         let mode = match eval {
             Eval::Mode(mode) => mode,
             Eval::Weights { .. } => 1,
@@ -9328,8 +9336,7 @@ impl<'a> Lower<'a> {
         Ok(self.as_int(acc))
     }
 
-    /// Vertex `k` (0 the provoking vertex, as `barycentric` orders them)
-    /// of a constant input element's channel, as a float.
+    /// A constant input's channel at vertex `k` in barycentric order.
     fn vertex_input(&mut self, id: usize, col: u8, k: u8) -> V {
         let e = &mut self.s.inputs[id];
         e.usage |= 1 << col;
@@ -9499,7 +9506,8 @@ impl<'a> Lower<'a> {
                 .is_some_and(|u| u.kind == ResourceType::Uav);
         let uint = !uav && !*d16 && *dmask == 1
             && matches!(name, "image_load" | "image_gather4_lz") && self.scalar_uint_srv(src, kind);
-        let props = (kind | if uav { 0x1000 } else { 0 }, if uint { 0x105 } else { 0x409 });
+        let shape = self.ordered_shape(site, kind | if uav { 0x1000 } else { 0 }, uav)?;
+        let props = (shape, if uint { 0x105 } else { 0x409 });
         if let Some(op) = name.strip_prefix("image_atomic_") {
             // GLC returns the old value. DXIL implements subtraction by adding
             // the two's complement of the operand at the same width.
@@ -11045,12 +11053,13 @@ impl<'a> Lower<'a> {
                 not_taken,
             } => {
                 // A negated condition branches the other way round.
-                let (cond, taken, not_taken) = match self.x.st.bools.node(when) {
-                    _ if self.x.st.wide.contains(&b) => {
+                let (cond, taken, not_taken) = match (self.ordered_branch(b, taken, not_taken), self.x.st.bools.node(when)) {
+                    (Some(c), _) => (c, taken, not_taken),
+                    (_, _) if self.x.st.wide.contains(&b) => {
                         let c = self.wave_wide(b, when).map_err(|w| unsupported(offset, w))?;
                         (c, taken, not_taken)
                     }
-                    Some((atom, Bool::TRUE, Bool::FALSE)) => {
+                    (_, Some((atom, Bool::TRUE, Bool::FALSE))) => {
                         let a = self
                             .atom(atom, self.cur)
                             .map_err(|w| unsupported(offset, w))?;

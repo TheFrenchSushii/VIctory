@@ -140,6 +140,21 @@ impl Host {
         software(&self.device)
     }
 
+    /// The maximum wave width reported by the device that creates the pipelines.
+    pub fn max_wave(&self) -> Result<u32, String> {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: the options structure matches the feature and remains writable until the call returns.
+        unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .map_err(err)?;
+        Ok(options.WaveLaneCountMax)
+    }
+
     /// The root signature translated shaders expect: user data per stage
     /// at `b0`, immediate samplers per stage at `s<n>`, heaps directly
     /// indexed.

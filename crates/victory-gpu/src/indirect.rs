@@ -51,21 +51,16 @@ static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
 static const uint SPLIT = 2;
-[RootSignature(RS)]
-[numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    uint eff_count = records;
-    bool ahead = (has_count & 2u) != 0;
-    bool split = (has_count & 4u) != 0;
-    if ((has_count & 1u) != 0) {
-        eff_count = min(eff_count, count_buf.Load(count_offset));
-    }
-    if (id.x >= eff_count) return;
-    uint src_at = args_offset + id.x * stride;
-    uint dst_at = id.x * stride;
-    uint cost;
-    uint2 draw_counts = uint2(0, 0);
-    uint3 groups = uint3(0, 0, 0);
+static const uint REJECTED = 0xffffffffu;
+groupshared uint effective_count;
+groupshared uint costs[64];
+groupshared uint mesh_groups[64];
+
+void clamp_record(uint src_at, bool ahead, bool split, out uint cost,
+                  out uint2 draw_counts, out uint3 groups, out uint mesh_asked) {
+    draw_counts = uint2(0, 0);
+    groups = uint3(0, 0, 0);
+    mesh_asked = 0;
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
         uint2 asked = src_args.Load2(src_at);
@@ -99,29 +94,15 @@ void main(uint3 id : SV_DispatchThreadID) {
         if (ahead && g.x > 65535u) {
             g = uint3(0, 0, 0);
         }
-        // Diagnostics, in the budget buffer's next words: the largest
-        // group count a mesh record asked for, and the groups asked in all.
-        uint was;
-        budget.InterlockedMax(4, g.x, was);
-        budget.InterlockedAdd(8, min(g.x, 1u << 24), was);
+        mesh_asked = g.x;
         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128u;
         groups = g;
     }
-    bool over = false;
-    if (cost > 0) {
-        uint before;
-        budget.InterlockedOr(0, 0, before);
-        [allow_uav_condition]
-        while (before < BUDGET) {
-            uint next = (BUDGET - before <= cost) ? BUDGET : (before + cost);
-            uint prev;
-            budget.InterlockedCompareExchange(0, before, next, prev);
-            if (prev == before) break;
-            before = prev;
-        }
-        over = before >= BUDGET || BUDGET - before < cost;
-    }
+}
+
+void write_record(uint src_at, uint dst_at, bool split, bool over,
+                  uint2 draw_counts, uint3 groups) {
     if (kind <= 1) {
         if (over) {
             draw_counts = uint2(0, 0);
@@ -145,6 +126,73 @@ void main(uint3 id : SV_DispatchThreadID) {
         dst_args.Store3(dst_at, groups);
         for (uint off = 12; off < stride; off += 4) {
             dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+        }
+    }
+}
+
+// A single group walks the records in tiles, with the first lane charging
+// the budget in record order. The other lanes prepare and write disjoint
+// records. No dispatch relies on scheduling or forward progress of a
+// compare-exchange loop spanning GPU waves.
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint lane : SV_GroupIndex) {
+    bool ahead = (has_count & 2u) != 0;
+    bool split = (has_count & 4u) != 0;
+    bool mesh = kind == 10;
+    uint left = 0;
+    uint largest = 0;
+    uint asked = 0;
+    if (lane == 0) {
+        effective_count = records;
+        if ((has_count & 1u) != 0) {
+            effective_count = min(records, count_buf.Load(count_offset));
+        }
+        left = BUDGET - min(budget.Load(0), BUDGET);
+        if (mesh) {
+            largest = budget.Load(4);
+            asked = budget.Load(8);
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    for (uint tile = 0; tile < effective_count; tile += 64) {
+        uint index = tile + lane;
+        uint src_at = args_offset + index * stride;
+        uint dst_at = index * stride;
+        uint cost = 0;
+        uint mesh_asked = 0;
+        uint2 draw_counts = uint2(0, 0);
+        uint3 groups = uint3(0, 0, 0);
+        if (index < effective_count) {
+            clamp_record(src_at, ahead, split, cost, draw_counts, groups, mesh_asked);
+        }
+        costs[lane] = cost;
+        mesh_groups[lane] = mesh_asked;
+        GroupMemoryBarrierWithGroupSync();
+        if (lane == 0) {
+            for (uint i = 0; i < 64; ++i) {
+                if (costs[i] > left) {
+                    left = 0;
+                    costs[i] = REJECTED;
+                } else {
+                    left -= costs[i];
+                }
+                if (mesh) {
+                    largest = max(largest, mesh_groups[i]);
+                    asked += min(min(mesh_groups[i], 1u << 24), 0xffffffffu - asked);
+                }
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (index < effective_count) {
+            write_record(src_at, dst_at, split, costs[lane] == REJECTED, draw_counts, groups);
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (lane == 0) {
+        budget.Store(0, BUDGET - left);
+        if (mesh) {
+            budget.Store2(4, uint2(largest, asked));
         }
     }
 }
@@ -428,7 +476,7 @@ fn record_clamp_as(
             l.SetComputeRootShaderResourceView(2, count_gpu);
             l.SetComputeRootUnorderedAccessView(3, dst_gpu);
             l.SetComputeRootUnorderedAccessView(4, budget);
-            l.Dispatch(records.div_ceil(64), 1, 1);
+            l.Dispatch(1, 1, 1);
         }
         l.ResourceBarrier(&second[skip..]);
     }
@@ -1245,7 +1293,7 @@ void main() {
         };
         const KIND_INDEXED: u32 = 1;
         const STRIDE: u32 = 24; // 5 indexed-draw words + 1 trailing custom word
-        const RECORDS: u32 = 128; // 2 waves of 64: old InterlockedAdd wrapped 2^32 at 64!
+        const RECORDS: u32 = 128; // Two tiles. The old atomic budget wrapped at record 64.
         const BUDGET_CAP: u32 = 1 << 27;
 
         let total_bytes = (STRIDE * RECORDS) as usize;
@@ -1328,6 +1376,7 @@ void main() {
         for i in 0..RECORDS as usize {
             let rec = &out_words[i * 6..(i + 1) * 6];
             if rec[0] == (1 << 24) && rec[1] == 4 {
+                assert!(i < 2, "budget belongs to the first two draws");
                 kept += 1;
             } else {
                 assert_eq!((rec[0], rec[1]), (0, 0), "excess draw must be zeroed");
